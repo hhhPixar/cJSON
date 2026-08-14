@@ -23,6 +23,32 @@
 #ifndef cJSON__h
 #define cJSON__h
 
+/*
+ * =============================================================================
+ *  cJSON 头文件导读（给 C 基础一般的读者）
+ *
+ *  你平时写 C，最常见的数据是：int、char*、结构体、数组。
+ *  JSON 比这些更“活”：一段文本里可能是数字、字符串、true/false/null，
+ *  还可能是数组 [ ... ] 或对象 { "键": 值 }，而且可以一层套一层。
+ *
+ *  cJSON 的做法很朴素：
+ *    1. 把 JSON 文本解析成一棵由 cJSON 结点组成的树（内存里的结构体）。
+ *    2. 你用 Get/Add/Replace 等函数读写这棵树。
+ *    3. 需要时再把树打印回 JSON 文本。
+ *
+ *  每个 JSON 值都是一个 cJSON 结构体。数组/对象的元素不是用 C 数组存的，
+ *  而是用双向链表串起来：父结点的 child 指向第一个孩子，孩子之间用 next/prev 连接。
+ *
+ *  类型存在 type 字段里，用“位标志”（1<<n）表示，所以可以和
+ *  cJSON_IsReference、cJSON_StringIsConst 等额外标志按位或（|）组合。
+ *
+ *  内存规则（非常重要）：
+ *    - cJSON_Parse* 得到的树，必须用 cJSON_Delete 释放。
+ *    - cJSON_Print* 得到的字符串，必须用 cJSON_free / free / 你自己的 hooks 释放
+ *      （cJSON_PrintPreallocated 除外，缓冲区是你自己提供的）。
+ * =============================================================================
+ */
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -85,7 +111,9 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 
 #include <stddef.h>
 
-/* cJSON Types: */
+/* JSON 值的类型。用“左移”得到互不重叠的比特位，便于以后和其它标志组合。
+ * 例如 cJSON_Number 是 1<<3，也就是二进制 ...00001000。
+ * 判断类型时通常写：item->type & cJSON_Number （只看这一位，忽略其它标志位）。 */
 #define cJSON_Invalid (0)
 #define cJSON_False  (1 << 0)
 #define cJSON_True   (1 << 1)
@@ -94,31 +122,45 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 #define cJSON_String (1 << 4)
 #define cJSON_Array  (1 << 5)
 #define cJSON_Object (1 << 6)
-#define cJSON_Raw    (1 << 7) /* raw json */
+#define cJSON_Raw    (1 << 7) /* 已经是 JSON 文本，打印时原样输出，不再转义 */
 
+/* 额外标志，和上面的类型按位或到同一个 type 里：
+ * IsReference：valuestring / child 指向别人的内存，Delete 时不要 free 它们。
+ * StringIsConst：string（对象的键名）是常量，Delete 时不要 free。 */
 #define cJSON_IsReference 256
 #define cJSON_StringIsConst 512
 
-/* The cJSON structure: */
+/* 一个 JSON 值 = 一个 cJSON 结点。
+ *
+ * 图解（对象 {"name":"Tom","age":18}）：
+ *
+ *   根(Object)
+ *     child --> [string="name", type=String, valuestring="Tom"]
+ *                  next <--> [string="age", type=Number, valuedouble=18]
+ *
+ * 数组同理：根 type=Array，孩子的 string 一般为 NULL（数组元素没有键名）。
+ */
 typedef struct cJSON
 {
-    /* next/prev allow you to walk array/object chains. Alternatively, use GetArraySize/GetArrayItem/GetObjectItem */
+    /* 兄弟结点：数组/对象里的下一个、上一个。最后一个的 next 为 NULL。
+     * 优化：第一个孩子的 prev 会指向最后一个孩子，方便 O(1) 在尾部追加。 */
     struct cJSON *next;
     struct cJSON *prev;
-    /* An array or object item will have a child pointer pointing to a chain of the items in the array/object. */
+    /* 第一个孩子。只有 Array / Object 才会用到。叶子结点（数字、字符串等）为 NULL。 */
     struct cJSON *child;
 
-    /* The type of the item, as above. */
+    /* 类型 + 可选标志，见上面的宏。 */
     int type;
 
-    /* The item's string, if type==cJSON_String  and type == cJSON_Raw */
+    /* 当 type 含 cJSON_String 或 cJSON_Raw 时，这里是字符串内容（堆上分配，需释放）。 */
     char *valuestring;
-    /* writing to valueint is DEPRECATED, use cJSON_SetNumberValue instead */
+    /* 数字的整数近似。溢出时会饱和到 INT_MAX/INT_MIN。请优先用 valuedouble。 */
     int valueint;
-    /* The item's number, if type==cJSON_Number */
+    /* 当 type 含 cJSON_Number 时，这里是真正的数值。 */
     double valuedouble;
 
-    /* The item's name string, if this item is the child of, or is in the list of subitems of an object. */
+    /* 若本结点是对象的成员，这里是键名，如 "age"。
+     * 数组元素、以及树的根结点通常为 NULL。注意：字段名叫 string，容易和 valuestring 搞混。 */
     char *string;
 } cJSON;
 
@@ -150,7 +192,7 @@ CJSON_PUBLIC(const char*) cJSON_Version(void);
 CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks);
 
 /* Memory Management: the caller is always responsible to free the results from all variants of cJSON_Parse (with cJSON_Delete) and cJSON_Print (with stdlib free, cJSON_Hooks.free_fn, or cJSON_free as appropriate). The exception is cJSON_PrintPreallocated, where the caller has full responsibility of the buffer. */
-/* Supply a block of JSON, and this returns a cJSON object you can interrogate. */
+/* 最常用的解析：输入必须是 '\0' 结尾的 C 字符串。失败返回 NULL，可用 cJSON_GetErrorPtr() 看大概位置。 */
 CJSON_PUBLIC(cJSON *) cJSON_Parse(const char *value);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_length);
 /* ParseWithOpts allows you to require (and check) that the JSON is null terminated, and to retrieve the pointer to the final byte parsed. */
@@ -158,9 +200,9 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_len
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return_parse_end, cJSON_bool require_null_terminated);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated);
 
-/* Render a cJSON entity to text for transfer/storage. */
+/* 打印成带缩进的 JSON。返回的 char* 要用 cJSON_free 释放。 */
 CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item);
-/* Render a cJSON entity to text for transfer/storage without any formatting. */
+/* 挤成一行，没有空格换行。 */
 CJSON_PUBLIC(char *) cJSON_PrintUnformatted(const cJSON *item);
 /* Render a cJSON entity to text using a buffered strategy. prebuffer is a guess at the final size. guessing well reduces reallocation. fmt=0 gives unformatted, =1 gives formatted */
 CJSON_PUBLIC(char *) cJSON_PrintBuffered(const cJSON *item, int prebuffer, cJSON_bool fmt);
@@ -292,7 +334,8 @@ CJSON_PUBLIC(char*) cJSON_SetValuestring(cJSON *object, const char *valuestring)
     cJSON_Invalid\
 )
 
-/* Macro for iterating over an array or object */
+/* Macro for iterating over an array or object：从 child 走到 next，直到 NULL。
+ * 用法：cJSON *elem; cJSON_ArrayForEach(elem, array) { ... } */
 #define cJSON_ArrayForEach(element, array) for(element = (array != NULL) ? (array)->child : NULL; element != NULL; element = element->next)
 
 /* malloc/free objects using the malloc/free functions that have been set with cJSON_InitHooks */
