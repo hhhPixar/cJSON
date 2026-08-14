@@ -24,23 +24,63 @@
 /* JSON parser in C. */
 /*
  * =============================================================================
- *  cJSON.c 实现导读
+ *  把本文件当 C 教材读（语法 / 指针对照表）
  *
- *  建议阅读顺序（和本文件大致一致）：
- *    1. 内存：internal_hooks / cJSON_New_Item / cJSON_Delete / cJSON_strdup
- *    2. 解析入口：cJSON_Parse* -> parse_value -> parse_number/string/array/object
- *    3. 打印入口：cJSON_Print* -> print -> print_value -> print_number/string/array/object
- *    4. 树操作：Get / Add / Detach / Replace / Create
+ *  本文件会反复出现这些 C 要点，后面函数里会再对着代码讲一遍：
  *
- *  解析是“递归下降”：看到什么字符就调用对应函数。
- *    '{' -> parse_object，'[' -> parse_array，'"' -> parse_string，数字 -> parse_number
- *  数组/对象会再次调用 parse_value，所以能解析任意嵌套。
+ *  【编译预处理】
+ *    #include     把别的文件粘进来。<> 找系统库，"" 找本目录。
+ *    #define A B  预处理器把 A 换成 B，不是真正的变量。
+ *    #ifdef / #ifndef / #endif  条件编译：有的宏没定义就不编这段。
+ *    #error       编译期直接失败（下面用来检查 .h 和 .c 版本是否一致）。
  *
- *  打印是解析的逆过程：根据 type 把结点写回文本。printbuffer 是一块会自动扩容的缓冲区。
+ *  【类型】
+ *    int / double / char / unsigned char / size_t
+ *    unsigned char 常用来当“原始字节”，避免 char 有的平台是有符号的。
+ *    size_t 是 sizeof、strlen 返回的无符号长度类型。
+ *    typedef struct X { ... } X;  给结构体起短名，后面写 X 即可。
  *
- *  两个内部结构体：
- *    parse_buffer  —— 读输入：content + offset（当前读到哪）+ depth（嵌套层数）
- *    printbuffer   —— 写输出：buffer + offset（已写长度）+ format（要不要缩进）
+ *  【指针 —— 本库的核心】
+ *    T *p;            p 里存的是“某块 T 的地址”，不是 T 本身。
+ *    *p               解引用：去那个地址上取/改值。
+ *    p->field         等价于 (*p).field，结构体指针专用。
+ *    NULL             空指针，表示“不指向任何有效对象”。解引用 NULL 会崩溃。
+ *    const T *p       不能通过 p 修改 *p（指向的内容只读）。
+ *    T * const p      p 本身不能改指向（指针变量只读）。
+ *    const T * const p  两者都不能改。本文件参数里大量出现。
+ *    p + n            指针加减：跳过 n 个 T，不是加 n 个字节。
+ *                     char* 加 1 就是下一个字节；cJSON* 加 1 会跳过整个结构体。
+ *    q - p            两个同类型指针相减，得到“中间隔了几个元素”（ptrdiff）。
+ *    (T*)expr         强制类型转换。malloc 返回 void*，要转成你真正要用的类型。
+ *
+ *  【内存】
+ *    栈：局部变量，函数返回就没了。parse_buffer buffer = {...} 在栈上。
+ *    堆：malloc/calloc 分配，必须自己 free。每个 cJSON 结点都在堆上。
+ *    泄漏：malloc 了不 free。
+ *    野指针：free 之后还用原来的指针。所以 Delete 里经常 pointer = NULL。
+ *
+ *  【字符串】
+ *    C 字符串 = 一段 char，最后一个字节必须是 '\0'（值为 0）。
+ *    "abc" 其实是 'a','b','c','\0'，占 4 字节。strlen("abc") == 3。
+ *    char *s 只是指向第一个字符。没有“字符串对象”。
+ *
+ *  【函数】
+ *    static 函数：只在本 .c 文件可见，头文件里没有声明，调用者用不了。
+ *    函数指针：void *(*allocate)(size_t);  变量里存的是函数地址，可以换成别的实现。
+ *
+ *  【其它语法】
+ *    if / while / for / do-while / switch-case / goto
+ *    本库大量用 goto fail; 做“出错后统一释放”，这是 C 里常见写法，不是坏习惯。
+ *    a & b, a | b, a << n   按位与/或/左移，用来把多个标志塞进一个 int。
+ *    a && b, a || b, !a     逻辑运算，注意和按位的区别。
+ *
+ *  建议阅读顺序：
+ *    New_Item / Delete / strdup     → 堆、指针、结构体
+ *    case_insensitive_strcmp        → *p、p++、C 字符串
+ *    parse_buffer 宏                → 指针加减
+ *    parse_value / parse_array      → 递归、链表
+ *    ensure                         → realloc、动态数组
+ *    add_item_to_array / Detach     → 双向链表改指针
  * =============================================================================
  */
 
@@ -79,7 +119,9 @@
 
 #include "cJSON.h"
 
-/* define our own boolean type */
+/* C89 没有 true/false 关键字。用宏冒充。
+ * 先 #undef 是防止别人的头文件已经定义过 true，造成重定义。
+ * ((cJSON_bool)1) 是强制类型转换：把字面量 1 当成 cJSON_bool（其实是 int）。 */
 #ifdef true
 #undef true
 #endif
@@ -90,7 +132,8 @@
 #endif
 #define false ((cJSON_bool)0)
 
-/* define isnan and isinf for ANSI C, if in C99 or above, isnan and isinf has been defined in math.h */
+/* NaN 的性质：任何数和自己比都相等，唯独 NaN != NaN。所以 d != d 就能判断 NaN。
+ * 无穷大：inf - inf 是 NaN，但普通数减自己是 0。 */
 #ifndef isinf
 #define isinf(d) (isnan((d - d)) && !isnan(d))
 #endif
@@ -106,8 +149,9 @@
 #endif
 #endif
 
-/* 解析失败时记下“出错位置”：json 指向整段输入，position 是出错偏移。
- * 这是全局变量，所以并发解析会互相覆盖，cJSON 默认不是线程安全的。 */
+/* 静态全局变量：整个 .c 文件共享一份，函数返回后还在。
+ * json 是“基址指针”，position 是从基址走多少个 unsigned char。
+ * 指针加法：json + position 得到出错那个字节的地址。 */
 typedef struct {
     const unsigned char *json;
     size_t position;
@@ -116,16 +160,21 @@ static error global_error = { NULL, 0 };
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
 {
+    /* 两个指针类型不同：json 是 unsigned char*，函数要返回 const char*，所以强制转换。
+     * 转换的是“指针的类型标签”，地址数值不变。 */
     return (const char*) (global_error.json + global_error.position);
 }
 
 CJSON_PUBLIC(char *) cJSON_GetStringValue(const cJSON * const item)
 {
+    /* item 是“指向常量结点的常量指针”：不能 item = ...，也不能 item->type = ... */
     if (!cJSON_IsString(item))
     {
         return NULL;
     }
 
+    /* 返回的是结点内部那块字符串的地址，不是拷贝。
+     * 你若 free 这个指针，结点就变成野指针；Delete 结点后你也不能再用这个返回值。 */
     return item->valuestring;
 }
 
@@ -139,20 +188,27 @@ CJSON_PUBLIC(double) cJSON_GetNumberValue(const cJSON * const item)
     return item->valuedouble;
 }
 
-/* This is a safeguard to prevent copy-pasters from using incompatible C and header files */
+/* 编译期断言：.h 和 .c 的版本宏必须相同，否则 #error 让编译失败。 */
 #if (CJSON_VERSION_MAJOR != 1) || (CJSON_VERSION_MINOR != 7) || (CJSON_VERSION_PATCH != 19)
     #error cJSON.h and cJSON.c have different versions. Make sure that both have the same.
 #endif
 
 CJSON_PUBLIC(const char*) cJSON_Version(void)
 {
+    /* static 局部数组：不在栈上，函数返回后还在，所以可以返回它的地址。
+     * 若写成 char version[15]; 然后 return version; 那是返回栈上即将销毁的数组，野指针。 */
     static char version[15];
     sprintf(version, "%i.%i.%i", CJSON_VERSION_MAJOR, CJSON_VERSION_MINOR, CJSON_VERSION_PATCH);
 
     return version;
 }
 
-/* Case insensitive string comparison, doesn't consider two NULL pointers equal though */
+/* 忽略大小写比较两个 C 字符串。返回 0 表示相等（和 strcmp 一样）。
+ *
+ * 参数是 unsigned char*：tolower 的参数若是负的 signed char 会出问题，
+ * 所以用 unsigned 存字节更安全。
+ *
+ * *string1  取当前字符；string1++ 让指针走向下一个字节。 */
 static int case_insensitive_strcmp(const unsigned char *string1, const unsigned char *string2)
 {
     if ((string1 == NULL) || (string2 == NULL))
@@ -160,11 +216,14 @@ static int case_insensitive_strcmp(const unsigned char *string1, const unsigned 
         return 1;
     }
 
+    /* 指针相等 = 指向同一块内存，内容一定相同，不必逐字节比。 */
     if (string1 == string2)
     {
         return 0;
     }
 
+    /* for 的第三个表达式里 (void)string1++ ：++ 有返回值，加 (void) 表示故意丢掉，消除警告。
+     * 循环条件：两个当前字符转小写后相同，才继续往后走。 */
     for(; tolower(*string1) == tolower(*string2); (void)string1++, string2++)
     {
         if (*string1 == '\0')
@@ -173,12 +232,16 @@ static int case_insensitive_strcmp(const unsigned char *string1, const unsigned 
         }
     }
 
+    /* 走到第一个不同的字符，返回差值（<0 / 0 / >0），便于排序。 */
     return tolower(*string1) - tolower(*string2);
 }
 
-/* 函数指针：把 malloc/free/realloc 抽象出来。
- * 嵌入式或有自己内存池的项目，可通过 cJSON_InitHooks 换成自定义分配器。
- * reallocate 可能为 NULL（自定义 malloc/free 时），那时扩容会改成“新分配 + memcpy + 释放旧块”。 */
+/* 函数指针结构体。三个成员都是“指向函数的指针”：
+ *   allocate   相当于 malloc
+ *   deallocate 相当于 free
+ *   reallocate 相当于 realloc，可能是 NULL（自定义分配器时）
+ *
+ * 调用方式：hooks->allocate(32);  先用 -> 取出函数指针，再像函数一样加括号。 */
 typedef struct internal_hooks
 {
     void *(CJSON_CDECL *allocate)(size_t size);
@@ -206,11 +269,19 @@ static void * CJSON_CDECL internal_realloc(void *pointer, size_t size)
 #define internal_realloc realloc
 #endif
 
-/* strlen of character literals resolved at compile time */
+/* sizeof("abc") == 4（含 '\0'），sizeof("") == 1。相减得到字面量字符数 3。
+ * 这是编译期算出来的，不调用 strlen。只能用于 "这种字面量"，不能用于指针。 */
 #define static_strlen(string_literal) (sizeof(string_literal) - sizeof(""))
 
+/* 文件级静态变量：所有内部 malloc 都走这里。InitHooks 会改这三个函数指针。 */
 static internal_hooks global_hooks = { internal_malloc, internal_free, internal_realloc };
 
+/* 复制一份 C 字符串到堆上（strdup 的自己实现）。
+ *
+ * 为什么要自己拷？原字符串可能是栈上的、或调用者马上要改的。
+ * 结点必须拥有自己那份，Delete 时才能放心 free。
+ *
+ * 步骤：算长度（含 '\0'）→ allocate → memcpy 整段字节。 */
 static unsigned char* cJSON_strdup(const unsigned char* string, const internal_hooks * const hooks)
 {
     size_t length = 0;
@@ -221,10 +292,12 @@ static unsigned char* cJSON_strdup(const unsigned char* string, const internal_h
         return NULL;
     }
 
+    /* strlen 不含 '\0'，所以 + sizeof("")（即 +1），拷贝时连结束符一起带走。 */
     length = strlen((const char*)string) + sizeof("");
     copy = (unsigned char*)hooks->allocate(length);
     if (copy == NULL)
     {
+        /* malloc 失败约定返回 NULL。调用者必须检查，否则后面 memcpy 会崩。 */
         return NULL;
     }
     memcpy(copy, string, length);
@@ -265,7 +338,14 @@ CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks)
     }
 }
 
-/* 分配一个全 0 的结点。type=0 表示 cJSON_Invalid，指针全是 NULL。 */
+/* 堆上分配一个结点，并把每个字节写成 0。
+ *
+ * sizeof(cJSON) 是整个结构体占多少字节（含所有指针和数字字段）。
+ * malloc 返回的是“未初始化的原始内存”，里面是垃圾值。
+ * 若不 memset，next/child 可能是随机地址，后面一解引用就崩。
+ *
+ * memset(node, '\0', n) 把 n 个字节都写成 0。对指针来说 0 就是 NULL。
+ * if (node) 等价于 if (node != NULL)。 */
 static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
 {
     cJSON* node = (cJSON*)hooks->allocate(sizeof(cJSON));
@@ -277,15 +357,19 @@ static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
     return node;
 }
 
-/* 释放一棵树（以及同一层 next 链上的所有兄弟）。
+/* 释放一棵树。这是学“指针所有权”最好的函数。
  *
- * 为什么用 while 而不是只递归自己？
- *   数组 [1,2,3] 的三个元素是 next 串起来的。如果只递归 child，兄弟就泄漏了。
- *   这里先记下 next，再递归 child，再释放自己，然后 item = next 继续。
+ * 内存图像：Delete(根) 必须
+ *   1. 递归 Delete(child)     —— 子树
+ *   2. 循环 item = item->next —— 兄弟（数组里 1,2,3 是兄弟，不是父子）
+ *   3. free 自己的 valuestring / string / 结点本身
  *
- * 两个不要乱 free 的标志：
- *   cJSON_IsReference —— child / valuestring 是“借来的”，所有权不在本结点。
- *   cJSON_StringIsConst —— 键名是字符串字面量，不能 free。 */
+ * 为什么先 next = item->next？
+ *   因为马上要把 item 这块内存 free 掉。free 之后 item->next 就是野指针，
+ *   必须提前把“下一个地址”保存在栈上的局部变量 next 里。
+ *
+ * type & 标志：按位与。该位是 1 表示“内存不是我的，别 free”。
+ * deallocate 之后立刻 = NULL：防止同一指针被 free 两次（double free）。 */
 CJSON_PUBLIC(void) cJSON_Delete(cJSON *item)
 {
     cJSON *next = NULL;
@@ -322,28 +406,46 @@ static unsigned char get_decimal_point(void)
 #endif
 }
 
-/* 解析时的“光标”。content 是整段 JSON，offset 是当前字符下标。
- * depth 用来限制嵌套，防止 {{{{{{ ... 把 C 栈递归爆掉。 */
+/* parse_buffer：解析时的“光标 + 整段输入”。
+ *
+ * content : 指向调用者那串 JSON 的第一个字节（我们不拥有这块内存，只读）
+ * length  : 一共多少字节
+ * offset  : 当前读到第几个字节（从 0 开始）
+ * depth   : 嵌套了几层 '[' 或 '{'
+ *
+ * 当前字符的地址 = content + offset
+ * 这就是指针加法：unsigned char* + size_t → 往后跳 offset 个字节。 */
 typedef struct
 {
     const unsigned char *content;
     size_t length;
     size_t offset;
-    size_t depth; /* How deeply nested (in arrays/objects) is the input at the current offset. */
+    size_t depth;
     internal_hooks hooks;
 } parse_buffer;
 
-/* 还能否再读 size 个字节？（size 从 1 起，例如读 "null" 要 can_read(..., 4)） */
+/* 宏是“文本替换”，没有函数调用开销，也没有类型检查。
+ *
+ * (buffer)->offset  必须加括号：如果有人写 can_read(p+1, 4)，没有括号会算错。
+ * && 短路：左边已经是假，右边根本不执行，所以 buffer==NULL 时不会去读 buffer->offset。 */
 #define can_read(buffer, size) ((buffer != NULL) && (((buffer)->offset + size) <= (buffer)->length))
-/* 当前 offset+index 这一格是否还在缓冲区内？（index 从 0 起） */
 #define can_access_at_index(buffer, index) ((buffer != NULL) && (((buffer)->offset + index) < (buffer)->length))
 #define cannot_access_at_index(buffer, index) (!can_access_at_index(buffer, index))
-/* 当前光标处的指针，相当于 &content[offset] */
+/* 得到“当前光标”指针。后面 [0] 就是当前字符，[1] 就是下一个。
+ * 数组下标 a[i] 本质是 *(a+i)。所以 p[0] 就是 *p。 */
 #define buffer_at_offset(buffer) ((buffer)->content + (buffer)->offset)
 
-/* 解析数字。JSON 只用 '.' 做小数点，但 C 的 strtod 会看本地化（有的地区是逗号），
- * 所以先把数字拷到临时缓冲区，必要时把 '.' 换成本地小数点，再 strtod。
- * 同时写入 valuedouble 和 valueint（溢出则饱和，避免 (int)1e20 变成未定义行为）。 */
+/* 解析数字到 item->valuedouble / valueint。
+ *
+ * 输入可能没有 '\0'（ParseWithLength），不能直接 strtod(原串)。
+ * 做法：把数字字符拷到自己 malloc 的临时缓冲，补上 '\0'，再 strtod。
+ *
+ * after_end：strtod 的第二个参数是 char**，它会把“数字结束位置”写进去。
+ *   (char**)&after_end  取 after_end 这个指针变量自己的地址，再转成 char**。
+ *   这是“输出参数”：函数通过修改你的指针变量，告诉你解析停在哪。
+ *
+ * after_end - number_c_string：两个指针相减 = 中间隔了多少个 unsigned char，
+ * 也就是数字占了几个字符。用这个推进 input_buffer->offset。 */
 static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_buffer)
 {
     double number = 0;
@@ -389,11 +491,13 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
                 break;
 
             default:
+                /* switch 里 default：不是数字字符就跳出 for。
+                 * goto 跳到循环后面的标签，比设一个 flag 再 break 两层更直接。 */
                 goto loop_end;
         }
     }
 loop_end:
-    /* malloc for temporary buffer, add 1 for '\0' */
+    /* 堆上临时缓冲。+1 给 '\0'。用完必须 deallocate，否则泄漏。 */
     number_c_string = (unsigned char *) input_buffer->hooks.allocate(number_string_length + 1);
     if (number_c_string == NULL)
     {
@@ -418,14 +522,14 @@ loop_end:
     number = strtod((const char*)number_c_string, (char**)&after_end);
     if (number_c_string == after_end)
     {
-        /* free the temporary buffer */
+        /* 两个指针相等 = strtod 一个数字都没吃掉，说明不是合法数字。 */
         input_buffer->hooks.deallocate(number_c_string);
-        return false; /* parse_error */
+        return false;
     }
 
     item->valuedouble = number;
 
-    /* use saturation in case of overflow */
+    /* (int)超大 double 在 C 里是未定义行为。先和 INT_MAX 比较，溢出就“饱和”到边界。 */
     if (number >= INT_MAX)
     {
         item->valueint = INT_MAX;
@@ -441,8 +545,8 @@ loop_end:
 
     item->type = cJSON_Number;
 
+    /* 指针相减得到“读了几个字符”，加到 offset 上，光标移到数字后面。 */
     input_buffer->offset += (size_t)(after_end - number_c_string);
-    /* free the temporary buffer */
     input_buffer->hooks.deallocate(number_c_string);
     return true;
 }
@@ -493,7 +597,8 @@ CJSON_PUBLIC(char*) cJSON_SetValuestring(cJSON *object, const char *valuestring)
 
     if (v1_len <= v2_len)
     {
-        /* strcpy does not handle overlapping string: [X1, X2] [Y1, Y2] => X2 < Y1 or Y2 < X1 */
+        /* 指针比较：两个 char* 比的是地址大小。
+         * 若两段内存重叠，strcpy 行为未定义。这里要求一段完全在另一段左边或右边。 */
         if (!( valuestring + v1_len < object->valuestring || object->valuestring + v2_len < valuestring ))
         {
             return NULL;
@@ -515,9 +620,14 @@ CJSON_PUBLIC(char*) cJSON_SetValuestring(cJSON *object, const char *valuestring)
     return copy;
 }
 
-/* 打印时的输出缓冲。offset 是已经写了多少字节，length 是当前容量。
- * format=1 时打印带换行和 Tab 的“好看”JSON；0 则挤成一行。
- * noalloc=1 表示缓冲区是调用者给的（PrintPreallocated），满了不能再扩。 */
+/* printbuffer：可扩容的输出数组（C 没有 vector，都是自己用指针+长度模拟）。
+ *
+ * buffer : 堆上（或调用者提供）的 char 数组首地址
+ * length : 当前容量（能装多少字节）
+ * offset : 已经写了多少字节，下一个字写在 buffer[offset]
+ * noalloc: 1 就不能 realloc，满了只能失败
+ *
+ * 关系：永远应有 offset < length，并留 1 字节给 '\0'。 */
 typedef struct
 {
     unsigned char *buffer;
@@ -529,8 +639,16 @@ typedef struct
     internal_hooks hooks;
 } printbuffer;
 
-/* 保证还能再写 needed 字节，不够就扩容（通常扩到 needed*2，减少反复 realloc）。
- * 成功时返回“当前写入位置”的指针，调用者直接往这里 memcpy / strcpy。 */
+/* 保证从当前 offset 起还能再写 needed 字节。
+ *
+ * 返回值：p->buffer + p->offset，即“现在该往哪写”。
+ * 调用者拿到后直接 *ptr = '[' 或 strcpy(ptr, "null")。
+ *
+ * 扩容：新容量约 needed*2。realloc 可能返回新地址，旧 buffer 失效，
+ * 所以必须 p->buffer = newbuffer 更新结构体里的指针。
+ *
+ * 没有 realloc 时：allocate 新块 → memcpy 旧内容 → deallocate 旧块。
+ * 这就是“手动 realloc”。 */
 static unsigned char* ensure(printbuffer * const p, size_t needed)
 {
     unsigned char *newbuffer = NULL;
@@ -556,10 +674,12 @@ static unsigned char* ensure(printbuffer * const p, size_t needed)
     needed += p->offset + 1;
     if (needed <= p->length)
     {
+        /* 容量够：返回当前写入点。注意这是指针加法，不是下标变量。 */
         return p->buffer + p->offset;
     }
 
     if (p->noalloc) {
+        /* 调用者禁止扩容（PrintPreallocated）。只能失败，不能越界写。 */
         return NULL;
     }
 
@@ -735,7 +855,8 @@ static unsigned parse_hex4(const unsigned char * const input)
 
         if (i < 3)
         {
-            /* shift left to make place for the next nibble */
+            /* << 4 等于乘 16：给下一个十六进制位腾出低 4 比特。
+             * 例如已读 'A'(10)，左移后变成 0xA0，再加下一个数字。 */
             h = h << 4;
         }
     }
@@ -858,6 +979,8 @@ static unsigned char utf16_literal_to_utf8(const unsigned char * const input_poi
         (*output_pointer)[0] = (unsigned char)(codepoint & 0x7F);
     }
 
+    /* output_pointer 的类型是 unsigned char**（指针的指针）。
+     * *output_pointer 才是真正的写指针。写完 n 字节后把它往前挪，调用者才能接着写。 */
     *output_pointer += utf8_length;
 
     return sequence_length;
@@ -866,11 +989,21 @@ fail:
     return 0;
 }
 
-/* 解析 "..." 字符串：去掉两端引号，把 \n \t \uXXXX 等转义还原成真实字符，
- * 结果放进 item->valuestring（一块新分配的、以 '\0' 结尾的 C 字符串）。
- * 第一遍扫描估算长度并分配；第二遍真正拷贝/解码。 */
+/* 解析 JSON 字符串字面量。
+ *
+ * 输入：光标停在开头的 '"' 上。
+ * 输出：item->valuestring 指向堆上新字符串（已去掉引号、已解码转义）。
+ *
+ * 两个指针一起走：
+ *   input_pointer  读原 JSON
+ *   output_pointer 写解码后的内容
+ * 它们可以差得很多：\n 在输入占 2 字节，输出只占 1 字节。
+ *
+ * input_end - input_buffer->content  指针相减得到“从开头数第几个字节”，
+ * 用来和 length 比较，防止读出界。 */
 static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_buffer)
 {
+    /* +1 跳过开头的 '"'，从第一个内容字符开始。 */
     const unsigned char *input_pointer = buffer_at_offset(input_buffer) + 1;
     const unsigned char *input_end = buffer_at_offset(input_buffer) + 1;
     unsigned char *output_pointer = NULL;
@@ -921,6 +1054,7 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     {
         if (*input_pointer != '\\')
         {
+            /* 普通字符：*dst++ = *src++  先赋值再让两个指针各 +1。 */
             *output_pointer++ = *input_pointer++;
         }
         /* escape sequence */
@@ -1135,8 +1269,8 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
 static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_buffer);
 static cJSON_bool print_object(const cJSON * const item, printbuffer * const output_buffer);
 
-/* 跳过空格、Tab、回车、换行。JSON 允许这些空白出现在值与值之间。
- * ASCII 里空白字符的码值都 <= 32。 */
+/* 跳过 ASCII 码 <= 32 的空白（空格 32、Tab 9、CR 13、LF 10）。
+ * 只增加 offset，不移动 content。content 始终指向整段输入的开头。 */
 static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
 {
     if ((buffer == NULL) || (buffer->content == NULL))
@@ -1162,7 +1296,8 @@ static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
     return buffer;
 }
 
-/* skip the UTF-8 BOM (byte order mark) if it is at the beginning of a buffer */
+/* UTF-8 BOM 是文件开头三个字节 EF BB BF，有的编辑器会加上。
+ * strncmp 比较原始字节。只在 offset==0（文件开头）时才跳。 */
 static parse_buffer *skip_utf8_bom(parse_buffer * const buffer)
 {
     if ((buffer == NULL) || (buffer->content == NULL) || (buffer->offset != 0))
@@ -1187,21 +1322,25 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
         return NULL;
     }
 
-    /* Adding null character size due to require_null_terminated. */
+    /* strlen 不含 '\0'。sizeof("")==1，加回来让 length 覆盖结束符。
+     * 这样 require_null_terminated 时能检查到末尾的 '\0'。 */
     buffer_length = strlen(value) + sizeof("");
 
     return cJSON_ParseWithLengthOpts(value, buffer_length, return_parse_end, require_null_terminated);
 }
 
 /* 真正干活的解析入口。
- * 1. 准备 parse_buffer（指向输入、记录 offset）
- * 2. New_Item 分配根结点
- * 3. 跳过 BOM 和空白，调用 parse_value 填满根结点
- * 4. 失败则 Delete 已建的半成品，并记下 global_error
  *
- * require_null_terminated=1 时，JSON 后面不能再跟别的非空白内容（防止 "truegarbage" 被当成 true）。 */
+ * 参数里的 const char **return_parse_end 是“指针的指针”：
+ *   调用者有一个 const char *end;  传 &end
+ *   函数里 *return_parse_end = 某个地址;  于是调用者的 end 被改掉
+ * 这是 C 里“函数要修改调用者的指针变量”的标准手法。只传 const char* 只能改字符，改不了那个指针变量本身。
+ *
+ * goto fail：C 没有 try/finally。出错要释放半成品树，用标签把清理代码写在一处。 */
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated)
 {
+    /* 复合字面量式的初始化：按字段顺序填 0。hooks 是内嵌结构体，所以是 {0,0,0}。
+     * buffer 是栈上变量。content 将指向调用者的 JSON，我们不 free content。 */
     parse_buffer buffer = { 0, 0, 0, 0, { 0, 0, 0 } };
     cJSON *item = NULL;
 
@@ -1220,11 +1359,16 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     buffer.hooks = global_hooks;
 
     item = cJSON_New_Item(&global_hooks);
-    if (item == NULL) /* memory fail */
+    if (item == NULL)
     {
         goto fail;
     }
 
+    /* 从内往外读：
+     *   skip_utf8_bom(&buffer)           传入栈上 buffer 的地址（parse_buffer*）
+     *   buffer_skip_whitespace(...)      同样返回那个指针
+     *   parse_value(item, 那个指针)      往 item 里填类型和值
+     * ! 把 cJSON_bool 变成“失败则进 if”。 */
     if (!parse_value(item, buffer_skip_whitespace(skip_utf8_bom(&buffer))))
     {
         /* parse failure. ep is set. */
@@ -1242,6 +1386,7 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     }
     if (return_parse_end)
     {
+        /* *p = ...  改的是调用者的那个指针变量。 */
         *return_parse_end = (const char*)buffer_at_offset(&buffer);
     }
 
@@ -1422,8 +1567,13 @@ CJSON_PUBLIC(cJSON_bool) cJSON_PrintPreallocated(cJSON *item, char *buffer, cons
     return print_value(item, &p);
 }
 
-/* 解析“一个 JSON 值”的分发函数：看当前字符/单词，转到对应的专用解析器。
- * 这就是递归下降的核心。array/object 里的每个元素还会再走进来。 */
+/* 解析“一个 JSON 值”的分发函数。递归下降的核心。
+ *
+ * strncmp(s, "null", 4)==0  比较最多 4 个字符。不依赖 s 后面有没有 '\0'。
+ * 成功后 offset += 4，光标跳过这个单词。
+ *
+ * 看到 '[' 就调 parse_array，它内部每个元素再调 parse_value —— 这就是递归。
+ * 函数调用会在栈上再开一帧。套太多层会栈溢出，所以 array/object 里要检查 depth。 */
 static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buffer)
 {
     if ((input_buffer == NULL) || (input_buffer->content == NULL))
@@ -1490,7 +1640,10 @@ static cJSON_bool print_value(const cJSON * const item, printbuffer * const outp
 
     switch ((item->type) & 0xFF)
     {
+        /* 0xFF = 二进制低 8 位全 1。& 之后高位的 IsReference 等被清掉，才能拿去和 case 比较。
+         * switch 比较的是整数，每个 case 落到对应写法。 */
         case cJSON_NULL:
+            /* "null" 4 个字符 + '\0' 共 5 字节。ensure 返回的是写入位置指针。 */
             output = ensure(output_buffer, 5);
             if (output == NULL)
             {
@@ -1553,14 +1706,19 @@ static cJSON_bool print_value(const cJSON * const item, printbuffer * const outp
 }
 
 /* 解析数组：[ value, value, ... ]
- * 每个 value 是一个新 cJSON 结点，用 next/prev 链成双向链表，最后挂到 item->child。
- * 空数组 [] 的 child 为 NULL。
  *
- * 循环技巧：先 offset-- 退到第一个元素前面的字符，再 do-while 里 offset++。
- * 这样“逗号后还有下一个元素”和“第一个元素”能走同一套逻辑。 */
+ * 链表接法（务必在纸上画）：
+ *   head         永远指向第一个元素
+ *   current_item 指向当前正在解析的那个
+ *   新结点：current->next = new;  new->prev = current;  current = new;
+ *
+ * 空数组：child 保持 NULL。
+ *
+ * 指针参数 item 是“数组这个结点本身”，孩子挂在 item->child 上，
+ * 不是改 item 这个指针变量（所以函数返回 bool，不返回新指针）。 */
 static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buffer)
 {
-    cJSON *head = NULL; /* head of the linked list */
+    cJSON *head = NULL;
     cJSON *current_item = NULL;
 
     if (input_buffer->depth >= CJSON_NESTING_LIMIT)
@@ -1605,12 +1763,12 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
         /* attach next item to list */
         if (head == NULL)
         {
-            /* start the linked list */
+            /* 第一个元素：三个名字指向同一块堆内存。赋值从右往左。 */
             current_item = head = new_item;
         }
         else
         {
-            /* add to the end and advance */
+            /* 双向链表插入尾部：只改指针，结点本身不在内存里搬家。 */
             current_item->next = new_item;
             new_item->prev = current_item;
             current_item = new_item;
@@ -1685,6 +1843,7 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
     output_buffer->offset++;
     output_buffer->depth++;
 
+    /* 沿兄弟指针走，不是用下标。C 数组才是 a[i]，链表只能 p = p->next。 */
     while (current_element != NULL)
     {
         if (!print_value(current_element, output_buffer))
@@ -1705,6 +1864,7 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
             {
                 *output_pointer++ = ' ';
             }
+            /* 先写内容再写 '\0'。++ 在赋值之后让指针指向下一格。 */
             *output_pointer = '\0';
             output_buffer->offset += length;
         }
@@ -1772,12 +1932,10 @@ static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_bu
         /* attach next item to list */
         if (head == NULL)
         {
-            /* start the linked list */
             current_item = head = new_item;
         }
         else
         {
-            /* add to the end and advance */
             current_item->next = new_item;
             new_item->prev = current_item;
             current_item = new_item;
@@ -1797,7 +1955,9 @@ static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_bu
         }
         buffer_skip_whitespace(input_buffer);
 
-        /* parse_string 把内容放进 valuestring。对对象来说那其实是键名，要挪到 string。 */
+        /* parse_string 把键名写进 valuestring。对象成员的键名规定放在 string 字段。
+         * 这里是指针赋值：string 和 valuestring 曾指向同一块堆内存。
+         * 必须立刻 valuestring = NULL，否则 Delete 会把同一块 free 两次。 */
         current_item->string = current_item->valuestring;
         current_item->valuestring = NULL;
 
@@ -1989,6 +2149,8 @@ CJSON_PUBLIC(int) cJSON_GetArraySize(const cJSON *array)
     return (int)size;
 }
 
+/* 按下标取数组元素。没有 O(1) 的 a[i]，只能从头走 i 步。
+ * index-- 直到 0；中途 current_child 变成 NULL 说明越界，返回 NULL。 */
 static cJSON* get_array_item(const cJSON *array, size_t index)
 {
     cJSON *current_child = NULL;
@@ -2073,8 +2235,9 @@ static void suffix_object(cJSON *prev, cJSON *item)
     item->prev = prev;
 }
 
-/* 浅拷贝出一个“引用结点”：结构体内容复制一份，但标上 IsReference，
- * Delete 引用结点时不会释放原来的 valuestring/child。用来把同一棵子树挂到多处。 */
+/* 浅拷贝：memcpy 整颗结构体（所有指针字段的“地址值”被复制，不是深拷贝所指内容）。
+ * 然后 type |= IsReference：Delete 这个新结点时不要 free 那些借来的指针。
+ * next/prev 清掉，避免新结点和原链表串在一起。 */
 static cJSON *create_reference(const cJSON *item, const internal_hooks * const hooks)
 {
     cJSON *reference = NULL;
@@ -2153,7 +2316,12 @@ static void* cast_away_const(const void* string)
 
 
 /* 对象 = 带键名的数组。先给 item->string 赋上键名，再当数组成员追加。
- * constant_key=1 时不拷贝键名（用于字符串字面量），并打上 cJSON_StringIsConst。 */
+ *
+ * constant_key=1：new_key 直接等于传入的指针（字面量 "age" 在只读段），
+ *   打上 StringIsConst，Delete 时不 free。这叫“借用”，不是“拥有”。
+ * constant_key=0：strdup 一份到堆上，结点拥有这块内存。
+ *
+ * ~cJSON_StringIsConst  按位取反后再 &，用来清掉这一位。 */
 static cJSON_bool add_item_to_object(cJSON * const object, const char * const string, cJSON * const item, const internal_hooks * const hooks, const cJSON_bool constant_key)
 {
     char *new_key = NULL;
@@ -2330,8 +2498,16 @@ CJSON_PUBLIC(cJSON*) cJSON_AddArrayToObject(cJSON * const object, const char * c
     return NULL;
 }
 
-/* 从父结点的孩子链表里摘下 item，不释放内存。调用者之后可以 Delete，或挂到别处。
- * 要处理三种位置：头、中间、尾；尾结点还要维护 child->prev（指向新的最后一个）。 */
+/* 从父结点的孩子链表里摘下 item，不释放内存。
+ *
+ * 双向链表删除的四句话（中间结点）：
+ *   item->prev->next = item->next;  左边那个改“后继”
+ *   item->next->prev = item->prev;  右边那个改“前驱”
+ *   item->prev = NULL;
+ *   item->next = NULL;              摘下来的结点不再指向原来的邻居
+ *
+ * 还要处理：删的是头（parent->child 改成第二个）、删的是尾（头的 prev 改成新尾）。
+ * 返回的指针仍有效，调用者可以 Delete，或 Add 到别处。 */
 CJSON_PUBLIC(cJSON *) cJSON_DetachItemViaPointer(cJSON *parent, cJSON * const item)
 {
     if ((parent == NULL) || (item == NULL) || (item != parent->child && item->prev == NULL))
@@ -2580,6 +2756,8 @@ CJSON_PUBLIC(cJSON *) cJSON_CreateBool(cJSON_bool boolean)
     return item;
 }
 
+/* 手工造一个数字结点。和 Parse 不同：不读文本，直接填字段。
+ * (int)num 是强制转换，小数部分截断。超出 int 范围不能直接转，见 saturation。 */
 CJSON_PUBLIC(cJSON *) cJSON_CreateNumber(double num)
 {
     cJSON *item = cJSON_New_Item(&global_hooks);
@@ -2606,6 +2784,8 @@ CJSON_PUBLIC(cJSON *) cJSON_CreateNumber(double num)
     return item;
 }
 
+/* strdup 之后 item 拥有自己的那份字符。参数 string 可以是字面量或马上要释放的缓冲。
+ * 若 strdup 失败：已经 New_Item 成功，必须 Delete(item)，否则泄漏这个空结点。 */
 CJSON_PUBLIC(cJSON *) cJSON_CreateString(const char *string)
 {
     cJSON *item = cJSON_New_Item(&global_hooks);

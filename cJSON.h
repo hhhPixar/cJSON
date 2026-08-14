@@ -25,27 +25,35 @@
 
 /*
  * =============================================================================
- *  cJSON 头文件导读（给 C 基础一般的读者）
+ *  cJSON.h —— 一边学 C，一边看接口
  *
- *  你平时写 C，最常见的数据是：int、char*、结构体、数组。
- *  JSON 比这些更“活”：一段文本里可能是数字、字符串、true/false/null，
- *  还可能是数组 [ ... ] 或对象 { "键": 值 }，而且可以一层套一层。
+ *  【头文件是干什么的】
+ *    .h 里放：类型定义、宏、函数声明（告诉编译器“有这么个函数，参数长这样”）。
+ *    .c 里放：函数的真正代码。
+ *    你的程序 #include "cJSON.h" 之后，才能调用 cJSON_Parse 等函数。
  *
- *  cJSON 的做法很朴素：
- *    1. 把 JSON 文本解析成一棵由 cJSON 结点组成的树（内存里的结构体）。
- *    2. 你用 Get/Add/Replace 等函数读写这棵树。
- *    3. 需要时再把树打印回 JSON 文本。
+ *  【为什么有 #ifndef cJSON__h】
+ *    这叫 include guard。同一个 .h 被 include 两次时，第二次宏已经定义，
+ *    中间整段会被跳过，避免 “typedef struct cJSON 重复定义” 的编译错误。
  *
- *  每个 JSON 值都是一个 cJSON 结构体。数组/对象的元素不是用 C 数组存的，
- *  而是用双向链表串起来：父结点的 child 指向第一个孩子，孩子之间用 next/prev 连接。
+ *  【extern "C"】
+ *    如果用 C++ 编译器包含本头文件，函数名不要被 C++ 改名（name mangling），
+ *    这样 C++ 才能链接到用 C 编译出来的 cJSON.o。纯 C 程序可以当这段不存在。
  *
- *  类型存在 type 字段里，用“位标志”（1<<n）表示，所以可以和
- *  cJSON_IsReference、cJSON_StringIsConst 等额外标志按位或（|）组合。
+ *  【CJSON_PUBLIC(type)】
+ *    这是宏，展开后大致就是 type，Windows 上还会加上 dllimport/dllexport。
+ *    读的时候把它看成：CJSON_PUBLIC(cJSON *) foo(...)  ≈  cJSON * foo(...)
  *
- *  内存规则（非常重要）：
- *    - cJSON_Parse* 得到的树，必须用 cJSON_Delete 释放。
- *    - cJSON_Print* 得到的字符串，必须用 cJSON_free / free / 你自己的 hooks 释放
- *      （cJSON_PrintPreallocated 除外，缓冲区是你自己提供的）。
+ *  【指针怎么读声明】
+ *    cJSON *item          指向一个结点的指针（可修改那个结点）
+ *    const cJSON *item    不能通过这个指针改结点内容（只读访问）
+ *    const char *s        指向只读字符；s[0]='x' 非法
+ *    const char **p       指向“一个 const char* 变量”的指针，用来把结果写回去
+ *                         （例如 return_parse_end，让函数修改调用者的指针变量）
+ *
+ *  内存规则：
+ *    Parse 得到的树     → cJSON_Delete
+ *    Print 得到的 char* → cJSON_free
  * =============================================================================
  */
 
@@ -111,9 +119,18 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 
 #include <stddef.h>
 
-/* JSON 值的类型。用“左移”得到互不重叠的比特位，便于以后和其它标志组合。
- * 例如 cJSON_Number 是 1<<3，也就是二进制 ...00001000。
- * 判断类型时通常写：item->type & cJSON_Number （只看这一位，忽略其它标志位）。 */
+/* JSON 值的类型。用“左移”得到互不重叠的比特位。
+ *
+ *  1 << n  意思是：数字 1 的二进制向左移 n 位。
+ *    1 << 0 = 1     二进制 00000001
+ *    1 << 1 = 2     二进制 00000010
+ *    1 << 3 = 8     二进制 00001000
+ *  这样每个类型独占一位，一个 int 里可以同时记下“我是 Number”和“我是引用”。
+ *
+ *  判断时用按位与 &，不要用 == ：
+ *    item->type & cJSON_Number     只看 Number 那一位是不是 1
+ *    若写成 item->type == cJSON_Number，带了 IsReference 标志时就会误判。
+ *  设置组合：item->type = cJSON_String | cJSON_IsReference;   （按位或） */
 #define cJSON_Invalid (0)
 #define cJSON_False  (1 << 0)
 #define cJSON_True   (1 << 1)
@@ -124,46 +141,63 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 #define cJSON_Object (1 << 6)
 #define cJSON_Raw    (1 << 7) /* 已经是 JSON 文本，打印时原样输出，不再转义 */
 
-/* 额外标志，和上面的类型按位或到同一个 type 里：
- * IsReference：valuestring / child 指向别人的内存，Delete 时不要 free 它们。
- * StringIsConst：string（对象的键名）是常量，Delete 时不要 free。 */
+/* 额外标志，数值超过 255，和上面低 8 位的类型不冲突。
+ * 打印时会用 type & 0xFF 把这些标志抹掉，只留下真正的 JSON 类型。 */
 #define cJSON_IsReference 256
 #define cJSON_StringIsConst 512
 
-/* 一个 JSON 值 = 一个 cJSON 结点。
+/* =============================================================================
+ *  struct cJSON —— 学结构体指针、链表、树 的核心
  *
- * 图解（对象 {"name":"Tom","age":18}）：
+ *  typedef struct cJSON { ... } cJSON;
+ *    左边 struct cJSON 是标签名（结构体内部要写“指向自己的指针”时必须用这个，
+ *    因为 typedef 的短名 cJSON 此时还没定义完）。
+ *    右边 cJSON 是类型别名，以后写 cJSON *p 即可，不必写 struct cJSON *p。
  *
- *   根(Object)
- *     child --> [string="name", type=String, valuestring="Tom"]
- *                  next <--> [string="age", type=Number, valuedouble=18]
+ *  三个指针字段构成“树 + 双向链表”：
  *
- * 数组同理：根 type=Array，孩子的 string 一般为 NULL（数组元素没有键名）。
- */
+ *    child : 第一个儿子（数组/对象才有；数字、字符串这里是 NULL）
+ *    next  : 右边的兄弟
+ *    prev  : 左边的兄弟
+ *
+ *  例：{"name":"Tom","age":18}
+ *
+ *    根 r          r->type == cJSON_Object
+ *    r->child -->  结点A (string="name", valuestring="Tom")
+ *                    A->next --> 结点B (string="age", valuedouble=18)
+ *                    B->next == NULL
+ *                    A->prev 实际指向 B   ← 特殊优化：头结点的 prev = 尾结点
+ *                    B->prev 指向 A       ← 普通双向链表
+ *
+ *  访问字段：
+ *    r.child          若 r 是结构体变量（很少这样用）
+ *    r->child         若 r 是指针（本库全是指针）
+ *    r->child->next   第二个孩子。若 child 是 NULL，这就崩了，所以先判空。
+ *
+ *  char *valuestring  和  char *string  都是“指向堆上某段以 \0 结尾的字符”。
+ *  它们本身只占一个指针那么大（常见 8 字节），真正的文字在别处。
+ * ============================================================================= */
 typedef struct cJSON
 {
-    /* 兄弟结点：数组/对象里的下一个、上一个。最后一个的 next 为 NULL。
-     * 优化：第一个孩子的 prev 会指向最后一个孩子，方便 O(1) 在尾部追加。 */
     struct cJSON *next;
     struct cJSON *prev;
-    /* 第一个孩子。只有 Array / Object 才会用到。叶子结点（数字、字符串等）为 NULL。 */
     struct cJSON *child;
 
-    /* 类型 + 可选标志，见上面的宏。 */
     int type;
 
-    /* 当 type 含 cJSON_String 或 cJSON_Raw 时，这里是字符串内容（堆上分配，需释放）。 */
     char *valuestring;
-    /* 数字的整数近似。溢出时会饱和到 INT_MAX/INT_MIN。请优先用 valuedouble。 */
     int valueint;
-    /* 当 type 含 cJSON_Number 时，这里是真正的数值。 */
     double valuedouble;
 
-    /* 若本结点是对象的成员，这里是键名，如 "age"。
-     * 数组元素、以及树的根结点通常为 NULL。注意：字段名叫 string，容易和 valuestring 搞混。 */
     char *string;
 } cJSON;
 
+/* 函数指针结构体：里面存的不是函数代码，而是“函数的地址”。
+ * 写法拆开看：
+ *   void *          返回类型（未指定类型的指针，常用来表示任意内存块）
+ *   (CJSON_CDECL *malloc_fn)  名叫 malloc_fn 的指针，指向一个函数
+ *   (size_t sz)     这个函数的参数
+ * 赋值：hooks.malloc_fn = malloc;  之后 hooks.malloc_fn(16) 就等于 malloc(16)。 */
 typedef struct cJSON_Hooks
 {
       /* malloc/free are CDECL on Windows regardless of the default calling convention of the compiler, so ensure the hooks allow passing those functions directly. */
@@ -171,6 +205,7 @@ typedef struct cJSON_Hooks
       void (CJSON_CDECL *free_fn)(void *ptr);
 } cJSON_Hooks;
 
+/* C89 没有 bool。用 int 冒充：0 为假，非 0 为真。后面 true/false 宏就是 1 和 0。 */
 typedef int cJSON_bool;
 
 /* Limits how deeply nested arrays/objects can be before cJSON rejects to parse them.
@@ -319,23 +354,26 @@ CJSON_PUBLIC(cJSON*) cJSON_AddRawToObject(cJSON * const object, const char * con
 CJSON_PUBLIC(cJSON*) cJSON_AddObjectToObject(cJSON * const object, const char * const name);
 CJSON_PUBLIC(cJSON*) cJSON_AddArrayToObject(cJSON * const object, const char * const name);
 
-/* When assigning an integer value, it needs to be propagated to valuedouble too. */
+/* 三元运算符：条件 ? 真时的值 : 假时的值。这里当“带返回值的 if”。
+ * (object) 为真才写入。连续赋值 a = b = x 从右往左，两个字段都变成 number。
+ * 宏没有类型，object 要自己加括号，防止 object+1 被拆开。 */
 #define cJSON_SetIntValue(object, number) ((object) ? (object)->valueint = (object)->valuedouble = (number) : (number))
-/* helper for the cJSON_SetNumberValue macro */
 CJSON_PUBLIC(double) cJSON_SetNumberHelper(cJSON *object, double number);
 #define cJSON_SetNumberValue(object, number) ((object != NULL) ? cJSON_SetNumberHelper(object, (double)number) : (number))
 /* Change the valuestring of a cJSON_String object, only takes effect when type of object is cJSON_String */
 CJSON_PUBLIC(char*) cJSON_SetValuestring(cJSON *object, const char *valuestring);
 
-/* If the object is not a boolean type this does nothing and returns cJSON_Invalid else it returns the new type*/
+/* 先用 & ~掩码 清掉 True/False 两位，再用 | 打上新的那一位。
+ * 宏是多行时每行末尾 \ 表示“下一行还是宏的一部分”。 */
 #define cJSON_SetBoolValue(object, boolValue) ( \
     (object != NULL && ((object)->type & (cJSON_False|cJSON_True))) ? \
     (object)->type=((object)->type &(~(cJSON_False|cJSON_True)))|((boolValue)?cJSON_True:cJSON_False) : \
     cJSON_Invalid\
 )
 
-/* Macro for iterating over an array or object：从 child 走到 next，直到 NULL。
- * 用法：cJSON *elem; cJSON_ArrayForEach(elem, array) { ... } */
+/* 这不是函数，是展开成 for 循环。element 必须是你事先声明的 cJSON*。
+ * 三部分：初值=第一个孩子；条件=还没到链尾；步进=走向 next。
+ * 用法：cJSON *elem; cJSON_ArrayForEach(elem, array) { 用 elem->... } */
 #define cJSON_ArrayForEach(element, array) for(element = (array != NULL) ? (array)->child : NULL; element != NULL; element = element->next)
 
 /* malloc/free objects using the malloc/free functions that have been set with cJSON_InitHooks */
