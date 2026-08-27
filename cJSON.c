@@ -448,27 +448,29 @@ typedef struct
  * 也就是数字占了几个字符。用这个推进 input_buffer->offset。 */
 static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_buffer)
 {
-    double number = 0;
-    unsigned char *after_end = NULL;
-    unsigned char *number_c_string;
-    unsigned char decimal_point = get_decimal_point();
-    size_t i = 0;
-    size_t number_string_length = 0;
-    cJSON_bool has_decimal_point = false;
+    double number = 0;                          /* 最终解析出的浮点值，先清零 */
+    unsigned char *after_end = NULL;            /* strtod 会把它改成“数字结束处”的地址 */
+    unsigned char *number_c_string;             /* 指向堆上临时拷贝的那串数字（带 '\0'） */
+    unsigned char decimal_point = get_decimal_point(); /* 当前 locale 的小数点，多数环境是 '.' */
+    size_t i = 0;                               /* 循环下标：从当前光标往后扫第几个字节 */
+    size_t number_string_length = 0;            /* 数字占了几个字符，后面用来 malloc / memcpy */
+    cJSON_bool has_decimal_point = false;       /* 有没有见到 '.'，决定要不要替换 locale 小数点 */
 
+    /* 空指针防护：|| 短路，左边已经真就不再读右边，避免 input_buffer 为 NULL 时解引用崩溃 */
     if ((input_buffer == NULL) || (input_buffer->content == NULL))
     {
-        return false;
+        return false;                           /* 解析失败：没有输入 */
     }
 
-    /* copy the number into a temporary buffer and replace '.' with the decimal point
-     * of the current locale (for strtod)
-     * This also takes care of '\0' not necessarily being available for marking the end of the input */
+    /* 先量出数字有多长。不能直接 strtod(原串)：ParseWithLength 的输入可能没有 '\0'。
+     * for 三部分：初始化 i=0；每次判断“光标+i 还在缓冲里”；循环末尾 i++。 */
     for (i = 0; can_access_at_index(input_buffer, i); i++)
     {
+        /* buffer_at_offset = content + offset，再 [i] 就是当前光标往后第 i 个字节。
+         * switch 按这个字符分类，多个 case 落到同一段代码叫“贯穿”。 */
         switch (buffer_at_offset(input_buffer)[i])
         {
-            case '0':
+            case '0':                           /* JSON 数字允许的字符：0-9、正负号、科学计数 e/E */
             case '1':
             case '2':
             case '3':
@@ -482,73 +484,78 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
             case '-':
             case 'e':
             case 'E':
-                number_string_length++;
-                break;
+                number_string_length++;         /* 这个字符算进数字长度 */
+                break;                          /* 跳出 switch（不是跳出 for），去 for 的 i++ */
 
-            case '.':
-                number_string_length++;
-                has_decimal_point = true;
+            case '.':                           /* JSON 小数点永远是 '.'，和 locale 无关 */
+                number_string_length++;         /* '.' 也是数字的一部分，长度 +1 */
+                has_decimal_point = true;       /* 记下：后面拷贝完要把 '.' 换成 locale 小数点 */
                 break;
 
             default:
-                /* switch 里 default：不是数字字符就跳出 for。
-                 * goto 跳到循环后面的标签，比设一个 flag 再 break 两层更直接。 */
+                /* 遇到逗号、空格、] 等“不是数字的字符”，数字结束。
+                 * break 只能跳出 switch；要跳出 for 用 goto 跳到循环后的标签。 */
                 goto loop_end;
         }
     }
-loop_end:
-    /* 堆上临时缓冲。+1 给 '\0'。用完必须 deallocate，否则泄漏。 */
+loop_end:                                       /* 标签：for 正常走完（撞到缓冲末尾）或 goto 都会到这里 */
+    /* hooks.allocate 一般就是 malloc。+1 是给结尾 '\0' 留一字节。
+     * (unsigned char *) 把 void* 转成我们要用的指针类型。 */
     number_c_string = (unsigned char *) input_buffer->hooks.allocate(number_string_length + 1);
-    if (number_c_string == NULL)
+    if (number_c_string == NULL)                /* malloc 失败返回 NULL，必须检查 */
     {
-        return false; /* allocation failure */
+        return false;                           /* 分配失败，同样算解析失败 */
     }
 
+    /* 从原 JSON 光标处拷 number_string_length 个字节到临时缓冲（还没有 '\0'） */
     memcpy(number_c_string, buffer_at_offset(input_buffer), number_string_length);
-    number_c_string[number_string_length] = '\0';
+    number_c_string[number_string_length] = '\0'; /* 自己补上结尾 0，C 字符串才合法，strtod 才知道停哪 */
 
-    if (has_decimal_point)
+    if (has_decimal_point)                      /* 没有小数点就不必扫第二遍 */
     {
-        for (i = 0; i < number_string_length; i++)
+        for (i = 0; i < number_string_length; i++) /* 在拷贝里找 '.' */
         {
-            if (number_c_string[i] == '.')
+            if (number_c_string[i] == '.')      /* 找到 JSON 的小数点 */
             {
-                /* replace '.' with the decimal point of the current locale (for strtod) */
+                /* strtod 按 locale 认小数点：德语环境是 ','。换成它，strtod 才认得出。 */
                 number_c_string[i] = decimal_point;
             }
         }
     }
 
+    /* strtod：把 C 字符串转成 double。第二个参数是 char**（输出参数）：
+     * 传入 after_end 这个指针变量的地址，strtod 会把“停下来的位置”写进去。
+     * (const char*) 和 (char**) 是类型转换，因为临时缓冲是 unsigned char*。 */
     number = strtod((const char*)number_c_string, (char**)&after_end);
-    if (number_c_string == after_end)
+    if (number_c_string == after_end)           /* 两个地址相同 = 一个数字字符都没吃掉 */
     {
-        /* 两个指针相等 = strtod 一个数字都没吃掉，说明不是合法数字。 */
-        input_buffer->hooks.deallocate(number_c_string);
-        return false;
+        input_buffer->hooks.deallocate(number_c_string); /* 失败也要释放，否则泄漏 */
+        return false;                           /* 不是合法数字，例如输入是 "true" */
     }
 
-    item->valuedouble = number;
+    item->valuedouble = number;                 /* 完整精度写进结点的 double 字段 */
 
-    /* (int)超大 double 在 C 里是未定义行为。先和 INT_MAX 比较，溢出就“饱和”到边界。 */
-    if (number >= INT_MAX)
+    /* 再填一份 int。超大 double 直接 (int) 是未定义行为，先和 INT_MAX/INT_MIN 比较，溢出就夹到边界。 */
+    if (number >= INT_MAX)                      /* INT_MAX 是 int 能表示的最大值（通常 2147483647） */
     {
-        item->valueint = INT_MAX;
+        item->valueint = INT_MAX;               /* 饱和：太大就记成 int 上限 */
     }
-    else if (number <= (double)INT_MIN)
+    else if (number <= (double)INT_MIN)         /* INT_MIN 先转成 double 再比，避免 int 比较的坑 */
     {
-        item->valueint = INT_MIN;
+        item->valueint = INT_MIN;               /* 饱和：太小就记成 int 下限 */
     }
     else
     {
-        item->valueint = (int)number;
+        item->valueint = (int)number;           /* 范围内：截断小数部分，1.9 变成 1 */
     }
 
-    item->type = cJSON_Number;
+    item->type = cJSON_Number;                  /* 标明这个结点是数字类型 */
 
-    /* 指针相减得到“读了几个字符”，加到 offset 上，光标移到数字后面。 */
+    /* after_end - number_c_string = 临时串里被 strtod 吃掉的字符数（指针相减）。
+     * 加到 offset 上，光标移到数字后面那个字符（例如逗号或 }）。 */
     input_buffer->offset += (size_t)(after_end - number_c_string);
-    input_buffer->hooks.deallocate(number_c_string);
-    return true;
+    input_buffer->hooks.deallocate(number_c_string); /* 临时缓冲用完立刻释放 */
+    return true;                                /* 成功：item 已填好，光标已前进 */
 }
 
 /* don't ask me, but the original cJSON_SetNumberValue returns an integer or double */
