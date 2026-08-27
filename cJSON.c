@@ -876,124 +876,115 @@ static unsigned parse_hex4(const unsigned char * const input)
  * 成功返回消耗的输入字节数（6 或 12），失败返回 0。 */
 static unsigned char utf16_literal_to_utf8(const unsigned char * const input_pointer, const unsigned char * const input_end, unsigned char **output_pointer)
 {
-    long unsigned int codepoint = 0;
-    unsigned int first_code = 0;
-    const unsigned char *first_sequence = input_pointer;
-    unsigned char utf8_length = 0;
-    unsigned char utf8_position = 0;
-    unsigned char sequence_length = 0;
-    unsigned char first_byte_mark = 0;
+    long unsigned int codepoint = 0;            /* 最终那个 Unicode 码点（一个整数，不是字节） */
+    unsigned int first_code = 0;                /* 第一个 \uXXXX 解出来的 16 位值 */
+    const unsigned char *first_sequence = input_pointer; /* 记住 '\' 的位置；后面 +2 才是四个十六进制 */
+    unsigned char utf8_length = 0;              /* 这个码点要写成几个 UTF-8 字节：1~4 */
+    unsigned char utf8_position = 0;            /* 从后往前填 UTF-8 后续字节时用的下标 */
+    unsigned char sequence_length = 0;          /* 输入侧吃掉多少字节：6 或 12，成功后返回给调用者 */
+    unsigned char first_byte_mark = 0;          /* 多字节 UTF-8 首字节的高位标记：110 / 1110 / 11110 */
 
-    if ((input_end - first_sequence) < 6)
+    if ((input_end - first_sequence) < 6)       /* \uXXXX 一共 6 个字节；指针相减看还剩几个 */
     {
-        /* input ends unexpectedly */
-        goto fail;
+        goto fail;                              /* 输入在半路上断了，例如 "\u12 */
     }
 
-    /* get the first utf16 sequence */
-    first_code = parse_hex4(first_sequence + 2);
+    first_code = parse_hex4(first_sequence + 2); /* 跳过 '\''u'，把后面 4 个十六进制字符收成整数 */
 
-    /* check that the code is valid */
+    /* 0xDC00~0xDFFF 是“低代理”，只能跟在高代理后面，单独出现非法 */
     if (((first_code >= 0xDC00) && (first_code <= 0xDFFF)))
     {
         goto fail;
     }
 
-    /* UTF16 surrogate pair */
+    /* 0xD800~0xDBFF 是“高代理”：后面还必须再跟一个 \uXXXX（低代理），两半拼成一个大码点 */
     if ((first_code >= 0xD800) && (first_code <= 0xDBFF))
     {
-        const unsigned char *second_sequence = first_sequence + 6;
-        unsigned int second_code = 0;
-        sequence_length = 12; /* \uXXXX\uXXXX */
+        const unsigned char *second_sequence = first_sequence + 6; /* 第二个 '\' 应该在这里 */
+        unsigned int second_code = 0;           /* 低代理那 16 位 */
+        sequence_length = 12;                   /* 两个 \uXXXX，输入共 12 字节 */
 
-        if ((input_end - second_sequence) < 6)
+        if ((input_end - second_sequence) < 6)  /* 高代理后面不够再读 6 字节 */
         {
-            /* input ends unexpectedly */
             goto fail;
         }
 
         if ((second_sequence[0] != '\\') || (second_sequence[1] != 'u'))
         {
-            /* missing second half of the surrogate pair */
-            goto fail;
+            goto fail;                          /* 后面不是 \u，代理对缺了一半 */
         }
 
-        /* get the second utf16 sequence */
-        second_code = parse_hex4(second_sequence + 2);
-        /* check that the code is valid */
+        second_code = parse_hex4(second_sequence + 2); /* 再读低代理的四个十六进制 */
         if ((second_code < 0xDC00) || (second_code > 0xDFFF))
         {
-            /* invalid second half of the surrogate pair */
-            goto fail;
+            goto fail;                          /* 第二段必须是低代理，不能是普通码元或又一个高代理 */
         }
 
-
-        /* calculate the unicode codepoint from the surrogate pair */
+        /* 公式（UTF-16）：码点 = 0x10000 + (高10位 << 10) | 低10位
+         * & 0x3FF 取出低 10 比特；高代理左移 10 位后和低代理按位或。
+         * 例如 😀 是 \uD83D\uDE00 → 0x1F600。 */
         codepoint = 0x10000 + (((first_code & 0x3FF) << 10) | (second_code & 0x3FF));
     }
     else
     {
-        sequence_length = 6; /* \uXXXX */
-        codepoint = first_code;
+        sequence_length = 6;                    /* 普通 BMP 字符，一个 \uXXXX 就够 */
+        codepoint = first_code;                 /* 码点就是这 16 位本身，例如 \u0041 → 'A' */
     }
 
-    /* encode as UTF-8
-     * takes at maximum 4 bytes to encode:
-     * 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
-    if (codepoint < 0x80)
+    /* 下面按码点大小决定 UTF-8 写几字节。UTF-8 最多 4 字节：
+     * 1 字节: 0xxxxxxx
+     * 2 字节: 110xxxxx 10xxxxxx
+     * 3 字节: 1110xxxx 10xxxxxx 10xxxxxx
+     * 4 字节: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+    if (codepoint < 0x80)                       /* ASCII：0~127，一个字节原样放下 */
     {
-        /* normal ascii, encoding 0xxxxxxx */
         utf8_length = 1;
     }
-    else if (codepoint < 0x800)
+    else if (codepoint < 0x800)                 /* 到 11 比特：拉丁扩展、希腊语等 */
     {
-        /* two bytes, encoding 110xxxxx 10xxxxxx */
         utf8_length = 2;
-        first_byte_mark = 0xC0; /* 11000000 */
+        first_byte_mark = 0xC0;                 /* 11000000，给首字节贴上 110 前缀 */
     }
-    else if (codepoint < 0x10000)
+    else if (codepoint < 0x10000)               /* 到 16 比特：中文、日文等 BMP */
     {
-        /* three bytes, encoding 1110xxxx 10xxxxxx 10xxxxxx */
         utf8_length = 3;
-        first_byte_mark = 0xE0; /* 11100000 */
+        first_byte_mark = 0xE0;                 /* 11100000 */
     }
-    else if (codepoint <= 0x10FFFF)
+    else if (codepoint <= 0x10FFFF)             /* Unicode 上限；emoji 走这里，4 字节 */
     {
-        /* four bytes, encoding 1110xxxx 10xxxxxx 10xxxxxx 10xxxxxx */
         utf8_length = 4;
-        first_byte_mark = 0xF0; /* 11110000 */
+        first_byte_mark = 0xF0;                 /* 11110000 */
     }
     else
     {
-        /* invalid unicode codepoint */
-        goto fail;
+        goto fail;                              /* 超出 Unicode 范围，不可能合法 */
     }
 
-    /* encode as utf8 */
+    /* 从后往前填“后续字节”。每个后续字节格式是 10xxxxxx：
+     * | 0x80 把最高两位置成 10，& 0xBF 清掉第 6 位，保证是 10xxxxxx。
+     * 填完一次，codepoint 右移 6 位，露出下一组要写的比特。 */
     for (utf8_position = (unsigned char)(utf8_length - 1); utf8_position > 0; utf8_position--)
     {
-        /* 10xxxxxx */
         (*output_pointer)[utf8_position] = (unsigned char)((codepoint | 0x80) & 0xBF);
-        codepoint >>= 6;
+        codepoint >>= 6;                        /* 丢掉已经写进后续字节的那 6 比特 */
     }
-    /* encode first byte */
-    if (utf8_length > 1)
+    if (utf8_length > 1)                        /* 多字节：首字节 = 剩下的低位 | 110/1110/11110 标记 */
     {
         (*output_pointer)[0] = (unsigned char)((codepoint | first_byte_mark) & 0xFF);
     }
     else
     {
-        (*output_pointer)[0] = (unsigned char)(codepoint & 0x7F);
+        (*output_pointer)[0] = (unsigned char)(codepoint & 0x7F); /* 单字节：只留低 7 位 */
     }
 
-    /* output_pointer 的类型是 unsigned char**（指针的指针）。
-     * *output_pointer 才是真正的写指针。写完 n 字节后把它往前挪，调用者才能接着写。 */
+    /* output_pointer 是 unsigned char**。*output_pointer 才是 parse_string 里的写指针。
+     * 写完 n 字节后把它往前挪 n，调用者才能接着写后面的字符。 */
     *output_pointer += utf8_length;
 
-    return sequence_length;
+    return sequence_length;                     /* 告诉 parse_string：输入要跳过 6 或 12 字节 */
 
 fail:
-    return 0;
+    return 0;                                   /* 约定：0 表示失败，调用者 goto fail */
 }
 
 /* 解析 JSON 字符串字面量。
@@ -1010,129 +1001,130 @@ fail:
  * 用来和 length 比较，防止读出界。 */
 static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_buffer)
 {
-    /* +1 跳过开头的 '"'，从第一个内容字符开始。 */
+    /* 两个读指针都从开头 '"' 的下一个字节起步。
+     * input_end 第一遍用来量长度（找到收尾 '"'），input_pointer 第二遍才真正解码。 */
     const unsigned char *input_pointer = buffer_at_offset(input_buffer) + 1;
     const unsigned char *input_end = buffer_at_offset(input_buffer) + 1;
-    unsigned char *output_pointer = NULL;
-    unsigned char *output = NULL;
+    unsigned char *output_pointer = NULL;       /* 往堆上结果里写的光标，第二遍才用 */
+    unsigned char *output = NULL;               /* 堆上结果的起点；失败时靠它判断要不要 free */
 
-    /* not a string */
-    if (buffer_at_offset(input_buffer)[0] != '\"')
+    if (buffer_at_offset(input_buffer)[0] != '\"') /* 光标必须停在开头的双引号上 */
     {
-        goto fail;
+        goto fail;                              /* 不是字符串 */
     }
 
-    {
-        /* calculate approximate size of the output (overestimate) */
-        size_t allocation_length = 0;
-        size_t skipped_bytes = 0;
+    {                                           /* 独立块：第一遍的局部变量离开大括号就没了 */
+        size_t allocation_length = 0;           /* 准备 malloc 多少字节（偏大一点也没关系） */
+        size_t skipped_bytes = 0;               /* 转义里“多出来、输出不需要”的字节数，主要是每个 '\' */
+        /* 没越界，且还没碰到未转义的收尾 '"'，就继续往前探。
+         * input_end - content：指针相减 = 从整段 JSON 开头数过了几个字节。 */
         while (((size_t)(input_end - input_buffer->content) < input_buffer->length) && (*input_end != '\"'))
         {
-            /* is escape sequence */
-            if (input_end[0] == '\\')
+            if (input_end[0] == '\\')           /* 见到反斜杠：下一个字符是转义，不是收尾引号 */
             {
+                /* '\' 已经是最后一个字节，后面没有可配对的字符，例如 "abc\ */
                 if ((size_t)(input_end + 1 - input_buffer->content) >= input_buffer->length)
                 {
-                    /* prevent buffer overflow when last input character is a backslash */
-                    goto fail;
+                    goto fail;                  /* 防止再读 input_end[1] 越界 */
                 }
-                skipped_bytes++;
-                input_end++;
+                skipped_bytes++;                /* 输出里不会留下这个 '\'，长度可以少算 1 */
+                input_end++;                    /* 先跳过 '\'，下面还会再 ++，等于连转义符一起跳过 */
             }
-            input_end++;
+            input_end++;                        /* 普通字符或转义的第二个字符，都往前走一格 */
         }
+        /* 走到缓冲末尾还没见到 '"'，或当前不是 '"'（理论上后者被 while 挡住了） */
         if (((size_t)(input_end - input_buffer->content) >= input_buffer->length) || (*input_end != '\"'))
         {
-            goto fail; /* string ended unexpectedly */
+            goto fail;                          /* 字符串没闭合，例如 "abc */
         }
 
-        /* This is at most how much we need for the output */
+        /* 从开头 '"' 到收尾 '"' 的跨度，减去那些 '\'。
+         * 这是上限：\n 输入 2 字节输出 1；\uXXXX 输入 6 输出最多 4，多分配一点没关系。 */
         allocation_length = (size_t) (input_end - buffer_at_offset(input_buffer)) - skipped_bytes;
+        /* + sizeof("") 即 +1，给结尾 '\0'。hooks.allocate 一般就是 malloc */
         output = (unsigned char*)input_buffer->hooks.allocate(allocation_length + sizeof(""));
-        if (output == NULL)
+        if (output == NULL)                     /* 分配失败 */
         {
-            goto fail; /* allocation failure */
+            goto fail;
         }
     }
 
-    output_pointer = output;
-    /* loop through the string literal */
-    while (input_pointer < input_end)
+    output_pointer = output;                    /* 写指针回到结果开头，开始第二遍：真正解码 */
+    while (input_pointer < input_end)           /* 一直写到收尾 '"' 之前（input_end 正指着那个 '"'） */
     {
-        if (*input_pointer != '\\')
+        if (*input_pointer != '\\')             /* 普通字符，原样拷到输出 */
         {
-            /* 普通字符：*dst++ = *src++  先赋值再让两个指针各 +1。 */
+            /* *dst++ = *src++：先把 *src 写成 *dst，然后两个指针各 +1 */
             *output_pointer++ = *input_pointer++;
         }
-        /* escape sequence */
-        else
+        else                                    /* 当前是 '\'，看下一个字符决定写成什么 */
         {
-            unsigned char sequence_length = 2;
-            if ((input_end - input_pointer) < 1)
+            unsigned char sequence_length = 2;  /* 默认转义占 2 字节：\n \t \" \\ 等 */
+            if ((input_end - input_pointer) < 1) /* 只剩 '\' 没有后继（第一遍其实已拦过） */
             {
                 goto fail;
             }
 
-            switch (input_pointer[1])
+            switch (input_pointer[1])           /* 看 '\' 后面那一个字符 */
             {
                 case 'b':
-                    *output_pointer++ = '\b';
+                    *output_pointer++ = '\b';   /* 退格，ASCII 8；输入 2 字节，输出 1 字节 */
                     break;
                 case 'f':
-                    *output_pointer++ = '\f';
+                    *output_pointer++ = '\f';   /* 换页，ASCII 12 */
                     break;
                 case 'n':
-                    *output_pointer++ = '\n';
+                    *output_pointer++ = '\n';   /* 换行。JSON 文本里是反斜杠+n，内存里是一个 0x0A */
                     break;
                 case 'r':
-                    *output_pointer++ = '\r';
+                    *output_pointer++ = '\r';   /* 回车 */
                     break;
                 case 't':
-                    *output_pointer++ = '\t';
+                    *output_pointer++ = '\t';   /* 制表符 */
                     break;
-                case '\"':
-                case '\\':
-                case '/':
-                    *output_pointer++ = input_pointer[1];
+                case '\"':                      /* \"  → 一个双引号字符 */
+                case '\\':                      /* \\  → 一个反斜杠 */
+                case '/':                       /* \/  → 一个斜杠（JSON 允许这样写，方便 </script>） */
+                    *output_pointer++ = input_pointer[1]; /* 输出就是 '\' 后面那个字符本身 */
                     break;
 
-                /* UTF-16 literal */
-                case 'u':
+                case 'u':                       /* \uXXXX：UTF-16 码元，要转成 UTF-8 再写入 */
+                    /* &output_pointer：传“写指针变量的地址”，函数内部会把写指针往前挪 */
                     sequence_length = utf16_literal_to_utf8(input_pointer, input_end, &output_pointer);
-                    if (sequence_length == 0)
+                    if (sequence_length == 0)   /* 0 表示 \u 非法，或代理对不完整 */
                     {
-                        /* failed to convert UTF16-literal to UTF-8 */
                         goto fail;
                     }
-                    break;
+                    break;                      /* sequence_length 是 6（一个 \uXXXX）或 12（代理对） */
 
                 default:
-                    goto fail;
+                    goto fail;                  /* JSON 不允许的转义，例如 \x \a */
             }
-            input_pointer += sequence_length;
+            input_pointer += sequence_length;   /* 读指针一次跳过整个转义序列，不要只 +1 */
         }
     }
 
-    /* zero terminate the output */
-    *output_pointer = '\0';
+    *output_pointer = '\0';                     /* C 字符串必须自己补结束符，strlen/printf 才认 */
 
-    item->type = cJSON_String;
-    item->valuestring = (char*)output;
+    item->type = cJSON_String;                  /* 标明这个结点是字符串 */
+    item->valuestring = (char*)output;          /* 结点拥有这块堆内存，Delete 时会 free */
 
+    /* input_end 指着收尾 '"'。减去整段 JSON 基址，得到这个 '"' 的下标 */
     input_buffer->offset = (size_t) (input_end - input_buffer->content);
-    input_buffer->offset++;
+    input_buffer->offset++;                     /* 再 +1，光标停在收尾引号后面（逗号、} 等） */
 
     return true;
 
 fail:
-    if (output != NULL)
+    if (output != NULL)                         /* 已经 malloc 过（可能只分配了还没写完） */
     {
-        input_buffer->hooks.deallocate(output);
-        output = NULL;
+        input_buffer->hooks.deallocate(output); /* 释放半成品，避免泄漏 */
+        output = NULL;                          /* 立刻置空，防止后面再 free 一次 */
     }
 
-    if (input_pointer != NULL)
+    if (input_pointer != NULL)                  /* 本函数里它一开始就被赋值了，这条几乎总是真 */
     {
+        /* 失败时光标尽量停在出错处，GetErrorPtr 才能指到问题字符 */
         input_buffer->offset = (size_t)(input_pointer - input_buffer->content);
     }
 
@@ -1346,89 +1338,95 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
  * goto fail：C 没有 try/finally。出错要释放半成品树，用标签把清理代码写在一处。 */
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated)
 {
-    /* 复合字面量式的初始化：按字段顺序填 0。hooks 是内嵌结构体，所以是 {0,0,0}。
-     * buffer 是栈上变量。content 将指向调用者的 JSON，我们不 free content。 */
+    /* 栈上的“光标”。{0,0,0,0,{0,0,0}} 按字段顺序清零：
+     * content/length/offset/depth 四个 0，内嵌 hooks 三个函数指针也是 0（NULL）。
+     * content 稍后指向调用者的 JSON，我们不拥有那块内存，不能 free 它。 */
     parse_buffer buffer = { 0, 0, 0, 0, { 0, 0, 0 } };
-    cJSON *item = NULL;
+    cJSON *item = NULL;                         /* 根结点指针，先空着；成功才指向堆上的树 */
 
-    /* reset error position */
-    global_error.json = NULL;
-    global_error.position = 0;
+    /* 上次失败留下的全局错误位置先清掉，免得上次的脏数据被 GetErrorPtr 读到 */
+    global_error.json = NULL;                   /* 基址指针清空 */
+    global_error.position = 0;                  /* 偏移清零 */
 
+    /* || 短路：value 为 NULL 就不再看右边。没有输入或长度为 0，直接失败 */
     if (value == NULL || 0 == buffer_length)
     {
-        goto fail;
+        goto fail;                              /* 跳到函数末尾统一清理；这里还没分配 item */
     }
 
-    buffer.content = (const unsigned char*)value;
-    buffer.length = buffer_length;
-    buffer.offset = 0;
-    buffer.hooks = global_hooks;
+    buffer.content = (const unsigned char*)value; /* 把调用者的 char* 当成字节序列；地址不变，只换类型标签 */
+    buffer.length = buffer_length;              /* 这段输入一共多少字节（可以没有结尾 '\0'） */
+    buffer.offset = 0;                          /* 光标从第 0 个字节开始 */
+    buffer.hooks = global_hooks;                /* 结构体赋值：整份拷贝 malloc/free/realloc 三个函数指针 */
 
-    item = cJSON_New_Item(&global_hooks);
-    if (item == NULL)
+    item = cJSON_New_Item(&global_hooks);       /* 堆上分配根结点并 memset 成 0；& 取全局 hooks 的地址 */
+    if (item == NULL)                           /* malloc 失败 */
     {
-        goto fail;
+        goto fail;                              /* 还没有半成品树，fail 里 Delete 会被 if 跳过 */
     }
 
-    /* 从内往外读：
-     *   skip_utf8_bom(&buffer)           传入栈上 buffer 的地址（parse_buffer*）
-     *   buffer_skip_whitespace(...)      同样返回那个指针
-     *   parse_value(item, 那个指针)      往 item 里填类型和值
-     * ! 把 cJSON_bool 变成“失败则进 if”。 */
+    /* 从内往外读这一长串：
+     *   &buffer                      栈上 buffer 的地址，类型是 parse_buffer*
+     *   skip_utf8_bom(...)           若开头是 EF BB BF，offset += 3；返回同一个指针
+     *   buffer_skip_whitespace(...)  跳过空格/换行等，返回同一个指针
+     *   parse_value(item, 那个指针)  看当前字符决定是数字/字符串/数组/对象……写入 item
+     *   !                           cJSON_bool 为 0（失败）时进入 if */
     if (!parse_value(item, buffer_skip_whitespace(skip_utf8_bom(&buffer))))
     {
-        /* parse failure. ep is set. */
-        goto fail;
+        goto fail;                              /* 语法错或内存不够：下面会 Delete 半成品树 */
     }
 
-    /* if we require null-terminated JSON without appended garbage, skip and then check for a null terminator */
+    /* require_null_terminated==1：值后面只许空白，然后必须是 '\0'，不许尾随垃圾（如 "1 2"） */
     if (require_null_terminated)
     {
-        buffer_skip_whitespace(&buffer);
+        buffer_skip_whitespace(&buffer);        /* 数字/对象结束后再跳空白，光标应落在 '\0' 上 */
+        /* 两种失败：光标已经越界，或当前字节不是 0。
+         * buffer_at_offset(&buffer)[0] 就是 content[offset] 那个字节。 */
         if ((buffer.offset >= buffer.length) || buffer_at_offset(&buffer)[0] != '\0')
         {
-            goto fail;
+            goto fail;                          /* 末尾不是干净的 C 字符串 */
         }
     }
-    if (return_parse_end)
+    if (return_parse_end)                       /* 调用者传了非 NULL：想知道“解析停在哪” */
     {
-        /* *p = ...  改的是调用者的那个指针变量。 */
+        /* *p = ... 改的是调用者的那个指针变量（例如 const char *end; 传了 &end）。
+         * 成功时指向值后面第一个没吃掉的字符（常是 '\0' 或尾随内容）。 */
         *return_parse_end = (const char*)buffer_at_offset(&buffer);
     }
 
-    return item;
+    return item;                                /* 成功：把根结点交给调用者，对方最后要 cJSON_Delete */
 
-fail:
-    if (item != NULL)
+fail:                                           /* 标签：上面任何 goto fail 都落到这里，相当于 C 的“统一清理” */
+    if (item != NULL)                           /* 根已经分配出来了（可能带半棵树） */
     {
-        cJSON_Delete(item);
+        cJSON_Delete(item);                     /* 递归释放 child/next 和本结点，避免泄漏 */
     }
 
-    if (value != NULL)
+    if (value != NULL)                          /* 有输入才能报告“错在第几个字节”；value==NULL 时没东西可指 */
     {
-        error local_error;
-        local_error.json = (const unsigned char*)value;
-        local_error.position = 0;
+        error local_error;                      /* 栈上临时错误记录，最后再拷进 global_error */
+        local_error.json = (const unsigned char*)value; /* 基址 = 整段 JSON 开头 */
+        local_error.position = 0;               /* 先假定错在开头，下面按光标修正 */
 
-        if (buffer.offset < buffer.length)
+        if (buffer.offset < buffer.length)      /* 光标还在缓冲内：错就在当前这个字节 */
         {
-            local_error.position = buffer.offset;
+            local_error.position = buffer.offset; /* 例如 "12x" 会停在 'x' */
         }
-        else if (buffer.length > 0)
+        else if (buffer.length > 0)             /* 光标已经走到末尾之后：夹到最后一个合法下标 */
         {
-            local_error.position = buffer.length - 1;
+            local_error.position = buffer.length - 1; /* length-1 才是最后一个字节，避免越界 */
         }
 
-        if (return_parse_end != NULL)
+        if (return_parse_end != NULL)           /* 失败时也写回结束指针，位置和 GetErrorPtr 一致 */
         {
+            /* json + position：指针加法，得到出错那个字节的地址，再转成 char* */
             *return_parse_end = (const char*)local_error.json + local_error.position;
         }
 
-        global_error = local_error;
+        global_error = local_error;             /* 结构体整体赋值；之后 cJSON_GetErrorPtr() 就能读到 */
     }
 
-    return NULL;
+    return NULL;                                /* 约定：解析失败返回空指针，不要解引用它 */
 }
 
 /* Default options for cJSON_Parse：不要求末尾必须是 '\0' 之后立刻结束，也不返回结束指针。 */
@@ -1583,56 +1581,60 @@ CJSON_PUBLIC(cJSON_bool) cJSON_PrintPreallocated(cJSON *item, char *buffer, cons
  * 函数调用会在栈上再开一帧。套太多层会栈溢出，所以 array/object 里要检查 depth。 */
 static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buffer)
 {
+    /* 空指针防护：|| 短路，左边已经真就不再读 content，避免崩溃 */
     if ((input_buffer == NULL) || (input_buffer->content == NULL))
     {
-        return false; /* no input */
+        return false;                           /* 没有输入，解析失败 */
     }
 
-    /* parse the different types of values */
-    /* null */
+    /* 下面按“当前光标上的字符”判断是哪种 JSON 值。先看字面量，再看 " - [ { */
+
+    /* can_read(..., 4)：从光标起还能安全读 4 字节，才去比 "null"
+     * strncmp 最多比 4 个字符，不要求后面有 '\0'（ParseWithLength 可能没有）
+     * == 0 表示这 4 个字节正好是 n-u-l-l */
     if (can_read(input_buffer, 4) && (strncmp((const char*)buffer_at_offset(input_buffer), "null", 4) == 0))
     {
-        item->type = cJSON_NULL;
-        input_buffer->offset += 4;
-        return true;
+        item->type = cJSON_NULL;                /* 结点类型标成 null（没有 valuestring/数字） */
+        input_buffer->offset += 4;              /* 光标跳过这 4 个字母，停在后面那个字符上 */
+        return true;                            /* 这一个值解析成功 */
     }
-    /* false */
+    /* false 比 true/null 多一个字母，所以要能读 5 字节 */
     if (can_read(input_buffer, 5) && (strncmp((const char*)buffer_at_offset(input_buffer), "false", 5) == 0))
     {
-        item->type = cJSON_False;
-        input_buffer->offset += 5;
+        item->type = cJSON_False;               /* 布尔假。valueint 保持 New_Item 时的 0 */
+        input_buffer->offset += 5;              /* 跳过 f-a-l-s-e */
         return true;
     }
-    /* true */
+    /* true 也是 4 个字母。注意必须先匹配 false，否则不会误伤（首字母不同） */
     if (can_read(input_buffer, 4) && (strncmp((const char*)buffer_at_offset(input_buffer), "true", 4) == 0))
     {
-        item->type = cJSON_True;
-        item->valueint = 1;
-        input_buffer->offset += 4;
+        item->type = cJSON_True;                /* 布尔真 */
+        item->valueint = 1;                     /* 顺手填 1，方便当整数用（false 保持 0） */
+        input_buffer->offset += 4;              /* 跳过 t-r-u-e */
         return true;
     }
-    /* string */
+    /* 当前字节是 '"'：这是字符串。把同一 item / 同一 buffer 交给 parse_string */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '\"'))
     {
-        return parse_string(item, input_buffer);
+        return parse_string(item, input_buffer); /* 成功与否直接返回给上层 */
     }
-    /* number */
+    /* 数字：以 '-' 或 '0'～'9' 开头（JSON 不允许 "+1" 这种） */
     if (can_access_at_index(input_buffer, 0) && ((buffer_at_offset(input_buffer)[0] == '-') || ((buffer_at_offset(input_buffer)[0] >= '0') && (buffer_at_offset(input_buffer)[0] <= '9'))))
     {
-        return parse_number(item, input_buffer);
+        return parse_number(item, input_buffer); /* 填 valuedouble / valueint */
     }
-    /* array */
+    /* '['：数组。parse_array 会给每个元素再调 parse_value，形成递归 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '['))
     {
         return parse_array(item, input_buffer);
     }
-    /* object */
+    /* '{'：对象。同样递归：每个成员的值再走 parse_value */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '{'))
     {
         return parse_object(item, input_buffer);
     }
 
-    return false;
+    return false;                               /* 当前字符对不上任何 JSON 值，例如 ',' 或乱码 */
 }
 
 /* 打印分发：按 type 的低 8 位（去掉 IsReference 等标志）选择怎么写文本。 */
@@ -1725,100 +1727,100 @@ static cJSON_bool print_value(const cJSON * const item, printbuffer * const outp
  * 不是改 item 这个指针变量（所以函数返回 bool，不返回新指针）。 */
 static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buffer)
 {
-    cJSON *head = NULL;
-    cJSON *current_item = NULL;
+    cJSON *head = NULL;                         /* 第一个元素；空数组一直保持 NULL */
+    cJSON *current_item = NULL;                 /* 当前刚接上、正在解析的那个元素 */
 
-    if (input_buffer->depth >= CJSON_NESTING_LIMIT)
+    if (input_buffer->depth >= CJSON_NESTING_LIMIT) /* 嵌套层数到顶，防止 [[[[... 撑爆调用栈 */
     {
-        return false; /* to deeply nested */
+        return false;                           /* 太深，直接失败（还没分配孩子，不用 Delete） */
     }
-    input_buffer->depth++;
+    input_buffer->depth++;                      /* 进入一层 '['，深度 +1；成功/失败出口都要 -- */
 
-    if (buffer_at_offset(input_buffer)[0] != '[')
+    if (buffer_at_offset(input_buffer)[0] != '[') /* 防御：调用方本该保证光标在 '[' 上 */
     {
-        /* not an array */
-        goto fail;
+        goto fail;                              /* 不是数组，走统一失败清理 */
     }
 
-    input_buffer->offset++;
-    buffer_skip_whitespace(input_buffer);
+    input_buffer->offset++;                     /* 吃掉 '['，光标来到第一个元素或 ']' 前面 */
+    buffer_skip_whitespace(input_buffer);       /* 跳过 "[   1" 这种括号后的空白 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == ']'))
     {
-        /* empty array */
-        goto success;
+        goto success;                           /* "[]"：没有孩子，child 保持 NULL */
     }
 
-    /* check if we skipped to the end of the buffer */
+    /* 空白跳完后已经没字符了，例如 "[" 然后输入结束 */
     if (cannot_access_at_index(input_buffer, 0))
     {
-        input_buffer->offset--;
+        input_buffer->offset--;                 /* 光标退回，让错误位置落在 '[' 上，方便 GetErrorPtr */
         goto fail;
     }
 
-    /* step back to character in front of the first element */
+    /* 故意退一格：后面 do 循环统一用 offset++ 跳过分隔符。
+     * 第一次跳过的是 '['，之后每次跳过的是 ','。这样循环体不用写两套。 */
     input_buffer->offset--;
-    /* loop through the comma separated array elements */
-    do
+    do                                          /* do-while：至少试图读一个元素（空数组已在上面返回） */
     {
-        /* allocate next item */
+        /* 每个元素都是独立的堆结点。&hooks：传入分配器地址 */
         cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks));
-        if (new_item == NULL)
+        if (new_item == NULL)                   /* malloc 失败 */
         {
-            goto fail; /* allocation failure */
+            goto fail;                          /* fail 里会 Delete 已经接上的 head 链表 */
         }
 
-        /* attach next item to list */
-        if (head == NULL)
+        if (head == NULL)                       /* 还没有第一个元素 */
         {
-            /* 第一个元素：三个名字指向同一块堆内存。赋值从右往左。 */
+            /* 从右往左赋值：head = new_item，再 current_item = head。
+             * 三个指针指向同一块堆内存。 */
             current_item = head = new_item;
         }
         else
         {
-            /* 双向链表插入尾部：只改指针，结点本身不在内存里搬家。 */
+            /* 接到尾巴：只改指针，结点不搬家。
+             *  A.next → B ， B.prev → A ，然后 current 改指 B */
             current_item->next = new_item;
             new_item->prev = current_item;
             current_item = new_item;
         }
 
-        /* parse next value */
-        input_buffer->offset++;
-        buffer_skip_whitespace(input_buffer);
-        if (!parse_value(current_item, input_buffer))
+        input_buffer->offset++;                 /* 第一次跳过 '['，之后跳过 ',' */
+        buffer_skip_whitespace(input_buffer);   /* 逗号后面也可能有空格：",  2" */
+        if (!parse_value(current_item, input_buffer)) /* 递归：元素可以是数字/字符串/再套一层数组 */
         {
-            goto fail; /* failed to parse value */
+            goto fail;                          /* 这个元素解析失败，整段数组作废 */
         }
-        buffer_skip_whitespace(input_buffer);
+        buffer_skip_whitespace(input_buffer);   /* 值后面的空白，好判断下一个字符是 ',' 还是 ']' */
     }
+    /* 当前字符是逗号就再转一圈；否则结束循环（期望看到 ']'） */
     while (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == ','));
 
     if (cannot_access_at_index(input_buffer, 0) || buffer_at_offset(input_buffer)[0] != ']')
     {
-        goto fail; /* expected end of array */
+        goto fail;                              /* 缺 ']'，或 [1 2] 这种少逗号 */
     }
 
-success:
-    input_buffer->depth--;
+success:                                        /* 空数组和有元素的数组都到这里收尾 */
+    input_buffer->depth--;                      /* 离开这一层 '['，和上面的 ++ 配对 */
 
-    if (head != NULL) {
-        /* 循环链表优化：第一个结点的 prev 指向最后一个，追加时不用从头走到尾。 */
+    if (head != NULL) {                         /* 非空：做一个“首尾相接”的小优化 */
+        /* 第一个结点的 prev 指向最后一个。以后往数组尾追加时，用 child->prev 就能找到尾巴，
+         * 不用从 head 一路 next 走过去。这不是完整的循环链表（尾巴的 next 仍是 NULL）。 */
         head->prev = current_item;
     }
 
-    item->type = cJSON_Array;
-    item->child = head;
+    item->type = cJSON_Array;                   /* 这个结点（原来是空壳）现在是数组 */
+    item->child = head;                         /* 孩子链表挂上去；空数组则 child == NULL */
 
-    input_buffer->offset++;
+    input_buffer->offset++;                     /* 吃掉 ']'，光标停在数组后面 */
 
-    return true;
+    return true;                                /* 成功；失败路径不会走到这里 */
 
 fail:
-    if (head != NULL)
+    if (head != NULL)                           /* 已经接出若干元素 */
     {
-        cJSON_Delete(head);
+        cJSON_Delete(head);                     /* 整条孩子链表释放，避免泄漏半成品 */
     }
 
-    return false;
+    return false;                               /* 调用方（parse_value）会再 Delete 数组结点自己 */
 }
 
 /* 把数组打印成 [a, b, c]。format 时逗号后加空格。沿 child->next 走，每个元素调 print_value。 */
@@ -1896,116 +1898,111 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
  *   2. 必须看到 ':'，再 parse_value 读真正的值。 */
 static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_buffer)
 {
-    cJSON *head = NULL; /* linked list head */
-    cJSON *current_item = NULL;
+    cJSON *head = NULL;                         /* 第一个成员；空对象一直保持 NULL */
+    cJSON *current_item = NULL;                 /* 当前正在解析的那个键值对结点 */
 
-    if (input_buffer->depth >= CJSON_NESTING_LIMIT)
+    if (input_buffer->depth >= CJSON_NESTING_LIMIT) /* 和数组一样：嵌套太深会撑爆栈 */
     {
-        return false; /* to deeply nested */
+        return false;                           /* 还没分配孩子，直接返回 */
     }
-    input_buffer->depth++;
+    input_buffer->depth++;                      /* 进入一层 '{' */
 
+    /* 比数组多一次越界检查：光标必须还能读，且当前是 '{' */
     if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != '{'))
     {
-        goto fail; /* not an object */
+        goto fail;                              /* 不是对象 */
     }
 
-    input_buffer->offset++;
-    buffer_skip_whitespace(input_buffer);
+    input_buffer->offset++;                     /* 吃掉 '{' */
+    buffer_skip_whitespace(input_buffer);       /* 跳过 "{  \"a\"" 这种空白 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '}'))
     {
-        goto success; /* empty object */
+        goto success;                           /* "{}"：没有成员 */
     }
 
-    /* check if we skipped to the end of the buffer */
-    if (cannot_access_at_index(input_buffer, 0))
+    if (cannot_access_at_index(input_buffer, 0)) /* "{" 之后输入就没了 */
     {
-        input_buffer->offset--;
+        input_buffer->offset--;                 /* 错误位置退回 '{' */
         goto fail;
     }
 
-    /* step back to character in front of the first element */
+    /* 和数组同一手法：退一格，循环里统一 offset++ 跳过 '{' 或 ',' */
     input_buffer->offset--;
-    /* loop through the comma separated array elements */
-    do
+    do                                          /* 至少读一对 "key": value */
     {
-        /* allocate next item */
-        cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks));
+        cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks)); /* 一个成员 = 一个 cJSON 结点 */
         if (new_item == NULL)
         {
-            goto fail; /* allocation failure */
+            goto fail;                          /* 分配失败，释放已接上的成员 */
         }
 
-        /* attach next item to list */
-        if (head == NULL)
+        if (head == NULL)                       /* 第一个成员 */
         {
-            current_item = head = new_item;
+            current_item = head = new_item;     /* 三个指针指向同一块 */
         }
         else
         {
-            current_item->next = new_item;
+            current_item->next = new_item;      /* 接到链表尾巴 */
             new_item->prev = current_item;
             current_item = new_item;
         }
 
-        if (cannot_access_at_index(input_buffer, 1))
+        if (cannot_access_at_index(input_buffer, 1)) /* 逗号/括号后面至少还要有一个字节（键名） */
         {
-            goto fail; /* nothing comes after the comma */
+            goto fail;                          /* "{," 或末尾截断 */
         }
 
-        /* parse the name of the child */
-        input_buffer->offset++;
-        buffer_skip_whitespace(input_buffer);
-        if (!parse_string(current_item, input_buffer))
+        input_buffer->offset++;                 /* 第一次跳 '{'，之后跳 ',' */
+        buffer_skip_whitespace(input_buffer);   /* 来到键名左边的 '"' */
+        if (!parse_string(current_item, input_buffer)) /* 键必须是字符串；写进 valuestring */
         {
-            goto fail; /* failed to parse name */
+            goto fail;                          /* 键不是 "..."，例如 {1:2} */
         }
-        buffer_skip_whitespace(input_buffer);
+        buffer_skip_whitespace(input_buffer);   /* "key" 和 ':' 之间的空白 */
 
-        /* parse_string 把键名写进 valuestring。对象成员的键名规定放在 string 字段。
-         * 这里是指针赋值：string 和 valuestring 曾指向同一块堆内存。
-         * 必须立刻 valuestring = NULL，否则 Delete 会把同一块 free 两次。 */
+        /* parse_string 只知道往 valuestring 写。对象规定键名放在 string 字段。
+         * 这是指针赋值，不是拷贝字符串：两指针曾指向同一块堆内存。
+         * 必须立刻把 valuestring 置 NULL，否则 Delete 会 free 两次（double free）。 */
         current_item->string = current_item->valuestring;
         current_item->valuestring = NULL;
 
         if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != ':'))
         {
-            goto fail; /* invalid object */
+            goto fail;                          /* 键后面必须是冒号，{"a" 1} 非法 */
         }
 
-        /* parse the value */
-        input_buffer->offset++;
-        buffer_skip_whitespace(input_buffer);
-        if (!parse_value(current_item, input_buffer))
+        input_buffer->offset++;                 /* 吃掉 ':' */
+        buffer_skip_whitespace(input_buffer);   /* 来到值的第一个字符 */
+        if (!parse_value(current_item, input_buffer)) /* 递归解析值（可再套对象/数组） */
         {
-            goto fail; /* failed to parse value */
+            goto fail;                          /* 值解析失败 */
         }
-        buffer_skip_whitespace(input_buffer);
+        buffer_skip_whitespace(input_buffer);   /* 值后面，准备看 ',' 还是 '}' */
     }
     while (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == ','));
 
     if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != '}'))
     {
-        goto fail; /* expected end of object */
+        goto fail;                              /* 缺 '}'，或两个成员之间少逗号 */
     }
 
 success:
-    input_buffer->depth--;
+    input_buffer->depth--;                      /* 离开这一层 '{' */
 
-    if (head != NULL) {
+    if (head != NULL) {                         /* 和非空数组相同：首结点 prev 记住尾巴 */
         head->prev = current_item;
     }
 
-    item->type = cJSON_Object;
-    item->child = head;
+    item->type = cJSON_Object;                  /* 这个结点现在是对象 */
+    item->child = head;                         /* 成员链表挂到 child 上 */
 
-    input_buffer->offset++;
+    input_buffer->offset++;                     /* 吃掉 '}' */
     return true;
 
 fail:
     if (head != NULL)
     {
-        cJSON_Delete(head);
+        cJSON_Delete(head);                     /* 已解析的成员（含键名字符串）全部释放 */
     }
 
     return false;
@@ -2266,38 +2263,40 @@ static cJSON *create_reference(const cJSON *item, const internal_hooks * const h
     return reference;
 }
 
+/* 把 item 接到 array（或 object）的孩子链表末尾。
+ *
+ * 数组/对象的元素都挂在 array->child 上，用 next/prev 串成双向链表。
+ * 为了追加是 O(1) 而不是从头走到尾：
+ *   第一个孩子的 prev 永远指向当前最后一个孩子（解析时也是这么记的）。
+ * 空链表时用 item->prev = item（自己指自己）表示“它既是头也是尾”。 */
 static cJSON_bool add_item_to_array(cJSON *array, cJSON *item)
 {
-    cJSON *child = NULL;
+    cJSON *child = NULL;                        /* 稍后等于现在的第一个孩子，可能是 NULL */
 
+    /* 空指针不能接；array == item 是自己把自己当孩子，会成环，直接拒绝 */
     if ((item == NULL) || (array == NULL) || (array == item))
     {
         return false;
     }
 
-    child = array->child;
-    /*
-     * 空链表：child = item，并且 item->prev = item（自己指向自己，表示“目前既是头也是尾”）。
-     * 非空：第一个孩子的 prev 就是当前尾结点，O(1) 接到尾部，再更新 child->prev。
-     */
-    if (child == NULL)
+    child = array->child;                       /* 记下当前头结点；后面只读这个指针，不再反复写 array->child */
+    if (child == NULL)                          /* 还没有任何元素：[] 或 {} */
     {
-        /* list is empty, start new one */
-        array->child = item;
-        item->prev = item;
-        item->next = NULL;
+        array->child = item;                    /* 头就是这个新结点 */
+        item->prev = item;                      /* 自己指自己：它现在也是尾巴。下次追加用 child->prev 就能找到它 */
+        item->next = NULL;                      /* 后面没有兄弟；遍历靠 next==NULL 结束，不是循环链表 */
     }
-    else
+    else                                        /* 已经有至少一个孩子 */
     {
-        /* append to the end */
-        if (child->prev)
+        if (child->prev)                        /* 正常情况下头的 prev 一定指向当前尾巴（含“只有一个、prev 指自己”） */
         {
+            /* suffix_object(尾巴, item)：尾巴.next → item，item.prev → 尾巴。只改这两个指针。 */
             suffix_object(child->prev, item);
-            array->child->prev = item;
+            array->child->prev = item;          /* 头的 prev 改指新尾巴，保持“prev 就是末尾”这个约定 */
         }
     }
 
-    return true;
+    return true;                                /* 约定成功返回非 0。注意：item 的所有权交给 array，之后由 Delete(array) 一起释放 */
 }
 
 /* Add item to array/object. */
